@@ -1,4 +1,4 @@
-"""Package root for llm_jp_vllm/llm_jp_4."""
+"""Package root for llm_jp_vllm/llmjp4."""
 
 from llm_jp_vllm.llmjp4.reasoning_parser import Llmjp4ReasoningParser
 

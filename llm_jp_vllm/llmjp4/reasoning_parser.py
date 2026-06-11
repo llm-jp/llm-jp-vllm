@@ -15,7 +15,7 @@ from vllm.reasoning.abs_reasoning_parsers import (
 )
 from vllm.tokenizers import TokenizerLike
 
-from llm_jp_vllm.llm_jp_4.harmony import HarmonyMessageParser
+from llm_jp_vllm.llmjp4.harmony import HarmonyMessageParser
 
 
 @ReasoningParserManager.register_module(["llmjp4"])  # type: ignore[arg-type]

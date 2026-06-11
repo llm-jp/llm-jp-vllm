@@ -34,4 +34,4 @@ jobs:
       run: uv run ruff check llm_jp_vllm
     
     - name: Perform format
-        uv run ruff format --check llm_jp_vllm
+      run: uv run ruff format --check llm_jp_vllm

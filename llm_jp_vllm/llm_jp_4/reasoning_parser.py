@@ -15,7 +15,7 @@ from vllm.reasoning.abs_reasoning_parsers import (
 )
 from vllm.tokenizers import TokenizerLike
 
-from llm_jp_vllm.harmony import HarmonyMessageParser
+from llm_jp_vllm.llm_jp_4.harmony import HarmonyMessageParser
 
 
 @ReasoningParserManager.register_module(["llmjp4"])  # type: ignore[arg-type]
@@ -30,8 +30,11 @@ class Llmjp4ReasoningParser(ReasoningParser):
         self._start_id = vocab["<|start|>"]
         self._end_id = vocab["<|end|>"]
         self._message_id = vocab["<|message|>"]
-        self._reasoning_end_prefix = tokenizer.encode("<|channel|>final")
-        self._reasoning_prefill = tokenizer.encode("<|start|>assistant")
+
+        # NOTE(odashi): Prevent accessing to tokenizer methods
+        # https://zenn.dev/yay1/articles/ad6958086670b0
+        self._reasoning_end_prefix = [9, 2520]  # tokenizer.encode("<|channel|>final")
+        self._reasoning_prefill = [10, 12811]  # tokenizer.encode("<|start|>assistant")
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         # Find the final message pattern: <|channel|>final ... <|message|>

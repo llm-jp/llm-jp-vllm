@@ -1,9 +1,9 @@
-name: Release workflow for PyPI
+name: Release workflow for TestPyPI
 
 on:
   push:
     tags:
-      - "v[0123456789].**"
+      - "__DO_NOT_TRIGGER__"
 
 jobs:
   build:
@@ -27,15 +27,15 @@ jobs:
         name: python-package-distributions
         path: dist/
 
-  publish-to-pypi:
-    name: Publish to PyPI
+  publish-to-testpypi:
+    name: Publish to TestPyPI
     if: startswith(github.ref, 'refs/tags/')
     needs:
     - build
     runs-on: ubuntu-latest
     environment:
-      name: pypi
-      url: https://pypi.org/p/llm-jp-vllm
+      name: testpypi
+      url: https://test.pypi.org/p/llm-jp-vllm
     permissions:
       id-token: write
     steps:
@@ -44,5 +44,7 @@ jobs:
       with:
         name: python-package-distributions
         path: dist/
-    - name: Publish to PyPI
+    - name: Publish to TestPyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/

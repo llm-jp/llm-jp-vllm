@@ -3,24 +3,48 @@ name: Release workflow
 on:
   push:
     tags:
-      - "v[0123456789].*"
+      - "v[0123456789].**"
 
 jobs:
-  release:
+  build:
+    name: Build distribution
     runs-on: ubuntu-latest
     steps:
-      - name: checkout
-        uses: actions/checkout@v3
-      - name: setup python
-        uses: actions/setup-python@v2
-        with:
-          python-version: "3.13"
-      - name: build
-        run: |
-          python -m pip install --upgrade build hatch
-          python -m hatch version "${GITHUB_REF_NAME}"
-          python -m build
-      - name: publish
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.x"
+    - name: Build
+      run: |
+        python -m pip install --upgrade build hatch
+        python -m hatch version "${GITHUB_REF_NAME}"
+        python -m build
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+
+  publish-to-testpypi:
+    name: Publish to TestPyPI
+    if: startswith(github.ref, 'refs/tags/')
+    needs:
+    - build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/llm-jp-vllm
+    permissions:
+      id-token: write
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+    - name: Publish to TestPyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/

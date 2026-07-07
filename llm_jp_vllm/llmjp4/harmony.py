@@ -3,16 +3,40 @@
 # but typing annotation is modified to follow vLLM standards.
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, auto
 from typing import Iterator, Sequence
 
 from vllm.tokenizers import TokenizerLike
+
+# Tool calls are addressed to the "functions" namespace; other recipients
+# (browser.*, python, ...) are built-in tools that must not be converted
+# into OpenAI tool_calls.
+FUNCTION_NAMESPACE = "functions."
+
+_RECIPIENT_PREFIX = "to="
+
+
+def strip_incomplete_decode(text: str) -> str:
+    """Drop the trailing U+FFFD of a partially decoded multi-byte
+    character; streaming callers withhold it until it completes."""
+    return text.rstrip("�")
 
 
 class HarmonyMessageEndType(Enum):
     INCOMPLETE = 0
     END = 1
     CALL = 2
+
+
+class HarmonyMessageKind(Enum):
+    """Classification of a Harmony message, mirroring gpt-oss's rules
+    (`_SegmentType.from_channel_and_recipient` in vllm/parser/harmony.py).
+    """
+
+    REASONING = auto()
+    CONTENT = auto()
+    TOOL_CALL = auto()
+    IGNORE = auto()
 
 
 @dataclass(frozen=True)
@@ -33,12 +57,51 @@ class HarmonyMessage:
     constrain: HarmonySequence | None = None
     content: HarmonySequence | None = None
 
+    @property
+    def start(self) -> int:
+        """Position of the message's <|start|> in the parsed sequence.
+
+        Section starts point just after their marker token; 0 when the
+        message opens the sequence without a <|start|>.
+        """
+        first_section = min(
+            (
+                section.start
+                for section in (self.role, self.channel, self.constrain, self.content)
+                if section is not None
+            ),
+            default=1,
+        )
+        return max(first_section - 1, 0)
+
+
+@dataclass(frozen=True)
+class HarmonyHeader:
+    """Parsed header metadata of a Harmony message."""
+
+    role: str | None = None
+    channel: str | None = None
+    recipient: str | None = None
+    content_type: str | None = None
+
+    @property
+    def kind(self) -> HarmonyMessageKind:
+        """Classification of the message this header belongs to."""
+        if self.recipient is not None:
+            if self.recipient.startswith(FUNCTION_NAMESPACE):
+                return HarmonyMessageKind.TOOL_CALL
+            return HarmonyMessageKind.IGNORE
+        if self.channel == "analysis":
+            return HarmonyMessageKind.REASONING
+        return HarmonyMessageKind.CONTENT
+
 
 class HarmonyMessageParser:
     """A parser that performs lexical analysis to extract Harmony messages."""
 
     def __init__(self, tokenizer: TokenizerLike):
         vocab = tokenizer.get_vocab()
+        self._tokenizer = tokenizer
         self._start_id = vocab["<|start|>"]
         self._begin_map = {
             vocab["<|start|>"]: "role",
@@ -51,6 +114,51 @@ class HarmonyMessageParser:
             vocab["<|return|>"]: HarmonyMessageEndType.END,
             vocab["<|call|>"]: HarmonyMessageEndType.CALL,
         }
+
+    def parse_header(self, message: HarmonyMessage) -> HarmonyHeader:
+        """Parse the header sections of a message into structured metadata.
+
+        Follows openai/harmony's `parse_header_from_string`: recipient
+        ("to=...") and content-type are read from the tail of the header
+        words, so a recipient is recognized on both sides of <|channel|>
+        (the LLM-jp-4 template and official examples place it differently).
+        """
+        role_words = self._section_words(message.role)
+        channel_words = self._section_words(message.channel)
+
+        role = role_words[0] if role_words else None
+        channel = channel_words[0] if channel_words else None
+        parts = role_words[1:] + channel_words[1:]
+
+        recipient: str | None = None
+        content_type: str | None = None
+        if parts:
+            last = parts[-1]
+            if last.startswith(_RECIPIENT_PREFIX):
+                recipient = last[len(_RECIPIENT_PREFIX) :]
+            elif len(parts) == 1:
+                # A single word that is not "to=..." is a bare recipient.
+                recipient = last
+            else:
+                # e.g. "to=functions.x json": content-type last, recipient before it
+                content_type = last
+                recipient = parts[-2].removeprefix(_RECIPIENT_PREFIX)
+
+        constrain_words = self._section_words(message.constrain)
+        if constrain_words:
+            content_type = constrain_words[0]
+
+        return HarmonyHeader(
+            role=role,
+            channel=channel,
+            recipient=recipient,
+            content_type=content_type,
+        )
+
+    def _section_words(self, section: HarmonySequence | None) -> list[str]:
+        if section is None:
+            return []
+        return self._tokenizer.decode(section.token_ids).split()
 
     def iter_messages(self, token_ids: Sequence[int]) -> Iterator[HarmonyMessage]:
         """

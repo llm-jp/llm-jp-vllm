@@ -6,6 +6,8 @@ from conftest import MULTIBYTE_PAIR_IDS, FakeLlmjp4Tokenizer
 
 pytest.importorskip("vllm")
 
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest  # noqa: E402
+
 from llm_jp_vllm.llmjp4.reasoning_parser import Llmjp4ReasoningParser  # noqa: E402
 from llm_jp_vllm.llmjp4.tool_parser import (  # noqa: E402
     ChatCompletionRequest,
@@ -110,6 +112,18 @@ def test_extract_tool_calls(
     ] == expected_calls
     # Each call is a separate invocation with a distinct call id.
     assert len({tool_call.id for tool_call in result.tool_calls}) == len(expected_calls)
+
+
+def test_adjust_request_ignores_responses_api_requests(tool_parser) -> None:
+    # ResponsesRequest has no stop_token_ids; the Harmony adjustments
+    # only apply to Chat Completions requests.
+    request = ResponsesRequest(
+        input="Hi", tools=[{"type": "function", "name": "echo", "parameters": {}}]
+    )
+
+    adjusted = tool_parser.adjust_request(request)
+
+    assert adjusted.skip_special_tokens is True
 
 
 def test_streaming_delta_protocol(

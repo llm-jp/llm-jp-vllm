@@ -196,22 +196,30 @@ class Llmjp4ReasoningParser(ReasoningParser):
     def _extract_reasoning_from_stripped_text(
         self, model_output: str
     ) -> tuple[str | None, str | None]:
-        # "|\s*$" also captures an analysis message truncated by max_tokens.
+        # Channel words are only markers at the string start or after an
+        # "assistant" role word; the same words inside the body text must
+        # not match. "|\s*$" also captures an analysis message truncated
+        # by max_tokens.
         reasoning_parts = [
             match.group(1).strip()
             for match in re.finditer(
-                r"(?:^|\s)analysis\s+(.*?)(?=\s+assistant\b|\s*$)",
+                r"(?:^|\bassistant\s+)analysis\s+(.*?)(?=\s+assistant\b|\s*$)",
                 model_output,
                 re.DOTALL,
             )
         ]
-        final_match = re.search(
-            r"(?:^|\s)assistant\s+final\s+(.*)", model_output, re.DOTALL
-        )
-        if not reasoning_parts and final_match is None:
+        # The last marker splits reasoning from content; earlier
+        # occurrences may be part of the reasoning text.
+        markers = list(re.finditer(r"(?:^|\s)assistant\s+final\s+", model_output))
+        if markers:
+            content = model_output[markers[-1].end() :].strip()
+        elif re.match(r"final\s", model_output):
+            content = model_output[len("final") :].strip()
+        else:
+            content = None
+        if not reasoning_parts and content is None:
             # No Harmony header words at all: plain text is the answer.
             return None, model_output
         # A generation truncated inside analysis must not fall back to
         # the raw output: that would serve the chain-of-thought as content.
-        content = final_match.group(1).strip() if final_match else None
         return "\n".join(reasoning_parts) or None, content

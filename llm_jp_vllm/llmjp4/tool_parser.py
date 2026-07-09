@@ -16,6 +16,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser, ToolParserManager
@@ -29,6 +30,10 @@ from llm_jp_vllm.llmjp4.harmony import (
 )
 
 logger = init_logger(__name__)
+
+# Serving layers without this attribute do not route named/required
+# tool_choice through the parser.
+_HONORS_REQUIRED_AND_NAMED = hasattr(ToolParser, "supports_required_and_named")
 
 
 @ToolParserManager.register_module(["llmjp4"])  # type: ignore[arg-type]
@@ -54,17 +59,25 @@ class Llmjp4ToolParser(ToolParser):
         self._sent_content_length: int = 0
         self._sent_reasoning_length: int = 0
 
-    def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
-        if not request.tools or request.tool_choice == "none":
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        # Only Chat Completions requests carry the fields adjusted below
+        # (ResponsesRequest has no stop_token_ids).
+        if (
+            not isinstance(request, ChatCompletionRequest)
+            or not request.tools
+            or request.tool_choice == "none"
+        ):
             return super().adjust_request(request)
 
         # Skip the base implementation for required/named tool_choice:
         # its bare-JSON structured outputs conflict with Harmony headers.
         if request.tool_choice in ("auto", None):
             request = super().adjust_request(request)
-        elif not hasattr(ToolParser, "supports_required_and_named"):
-            # Without this attribute, serving would return raw Harmony
-            # text as the tool arguments; fail fast.
+        elif not _HONORS_REQUIRED_AND_NAMED:
+            # Serving would return raw Harmony text as the tool
+            # arguments; fail fast.
             raise ValueError(
                 f"tool_choice={request.tool_choice!r} is not supported by the "
                 "llmjp4 tool parser on this vLLM version"
@@ -200,7 +213,7 @@ class Llmjp4ToolParser(ToolParser):
                     index=index,
                     id=make_tool_call_id(),
                     type="function",
-                    function=DeltaFunctionCall(name=name).model_dump(exclude_none=True),
+                    function=DeltaFunctionCall(name=name),
                 )
             )
 
@@ -211,9 +224,7 @@ class Llmjp4ToolParser(ToolParser):
             deltas.append(
                 DeltaToolCall(
                     index=index,
-                    function=DeltaFunctionCall(arguments=args_delta).model_dump(
-                        exclude_none=True
-                    ),
+                    function=DeltaFunctionCall(arguments=args_delta),
                 )
             )
             self.streamed_args_for_tool[index] += args_delta

@@ -60,11 +60,18 @@ def test_extract_reasoning_keeps_markers_for_tool_calls_and_collects_late_analys
         ("analysis Reasoning", ("Reasoning", None)),
         ("analysis Reasoning assistant final Content", ("Reasoning", "Content")),
         ("Content", (None, "Content")),
+        (
+            "Here is my analysis of the data.",
+            (None, "Here is my analysis of the data."),
+        ),
+        ("final Content", (None, "Content")),
     ],
     ids=[
         "truncated-analysis-must-not-leak-cot-into-content",
         "content-excludes-the-marker-words",
         "plain-text-is-the-content",
+        "body-words-are-not-markers",
+        "leading-final-channel-word-is-stripped",
     ],
 )
 def test_extract_reasoning_from_stripped_text(

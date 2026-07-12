@@ -3,7 +3,6 @@
 # but applies some modification.
 # https://github.com/llm-jp/vllm/blob/4383f1532e87e77b6f961e633230f47467cbd072/vllm/reasoning/gptoss_reasoning_parser.py#L65
 
-import re
 from collections.abc import Sequence
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
@@ -44,6 +43,14 @@ class Llmjp4ReasoningParser(ReasoningParser):
         # on this cumulative stream advanced in extract_reasoning_streaming.
         self._stream = HarmonyStreamParser(self._parser, self._reasoning_prefill)
 
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        # Marker-based extraction needs the special tokens kept in the
+        # output text.
+        request.skip_special_tokens = False
+        return super().adjust_request(request)
+
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         if self._stream.content_started:
             return True
@@ -75,7 +82,9 @@ class Llmjp4ReasoningParser(ReasoningParser):
             marker in model_output
             for marker in ("<|channel|>", "<|start|>", "<|message|>")
         ):
-            return self._extract_reasoning_from_stripped_text(model_output)
+            # adjust_request keeps the special tokens, so marker-less
+            # text is a plain answer.
+            return None, model_output
 
         token_ids = self.model_tokenizer.encode(model_output, add_special_tokens=False)
         # Analysis may reappear after the first content/tool message,
@@ -176,35 +185,3 @@ class Llmjp4ReasoningParser(ReasoningParser):
             elif kind is HarmonyMessageKind.CONTENT:
                 content_parts.append(text)
         return "\n".join(reasoning_parts), "\n".join(content_parts)
-
-    def _extract_reasoning_from_stripped_text(
-        self, model_output: str
-    ) -> tuple[str | None, str | None]:
-        # Channel words are only markers at the string start or after an
-        # "assistant" role word; the same words inside the body text must
-        # not match. "|\s*$" also captures an analysis message truncated
-        # by max_tokens.
-        reasoning_parts = [
-            match.group(1).strip()
-            for match in re.finditer(
-                r"(?:^|\bassistant\s+)analysis\s+(.*?)"
-                r"(?=\s+assistant\s+(?:analysis|commentary|final)\b|\s*$)",
-                model_output,
-                re.DOTALL,
-            )
-        ]
-        # The last marker splits reasoning from content; earlier
-        # occurrences may be part of the reasoning text.
-        markers = list(re.finditer(r"(?:^|\s)assistant\s+final\s+", model_output))
-        if markers:
-            content = model_output[markers[-1].end() :].strip()
-        elif re.match(r"final\s", model_output):
-            content = model_output[len("final") :].strip()
-        else:
-            content = None
-        if not reasoning_parts and content is None:
-            # No Harmony header words at all: plain text is the answer.
-            return None, model_output
-        # A generation truncated inside analysis must not fall back to
-        # the raw output: that would serve the chain-of-thought as content.
-        return "\n".join(reasoning_parts) or None, content

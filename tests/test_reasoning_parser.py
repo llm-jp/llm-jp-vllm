@@ -4,6 +4,9 @@ from conftest import MULTIBYTE_CHAR_IDS, FakeLlmjp4Tokenizer
 
 pytest.importorskip("vllm")
 
+from vllm.entrypoints.openai.chat_completion.protocol import (  # noqa: E402
+    ChatCompletionRequest,
+)
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage  # noqa: E402
 
 from llm_jp_vllm.llmjp4.reasoning_parser import Llmjp4ReasoningParser  # noqa: E402
@@ -69,32 +72,10 @@ def stream_deltas(
             ),
             id="tool-call-markers-survive-for-the-tool-parser",
         ),
-        # Stripped output: the fallback for requests served with
-        # skip_special_tokens=True.
-        pytest.param(
-            "analysis Reasoning",
-            ("Reasoning", None),
-            id="stripped-truncated-analysis-must-not-leak-cot",
-        ),
-        pytest.param(
-            "analysis Reasoning assistant final Content",
-            ("Reasoning", "Content"),
-            id="stripped-content-excludes-the-marker-words",
-        ),
         pytest.param(
             "Here is my analysis of the data.",
             (None, "Here is my analysis of the data."),
-            id="stripped-body-words-are-not-markers",
-        ),
-        pytest.param(
-            "final Content",
-            (None, "Content"),
-            id="stripped-leading-final-channel-word",
-        ),
-        pytest.param(
-            "analysis The assistant should reply politely assistant final Hi",
-            ("The assistant should reply politely", "Hi"),
-            id="stripped-assistant-word-in-body-does-not-truncate",
+            id="marker-less-output-is-plain-content",
         ),
     ],
 )
@@ -102,6 +83,12 @@ def test_extract_reasoning(
     reasoning_parser, model_output: str, expected: tuple[str | None, str | None]
 ) -> None:
     assert reasoning_parser.extract_reasoning(model_output, request=None) == expected
+
+
+def test_adjust_request_keeps_special_tokens(reasoning_parser) -> None:
+    request = ChatCompletionRequest(model="llm-jp-4", messages=[])
+
+    assert reasoning_parser.adjust_request(request).skip_special_tokens is False
 
 
 @pytest.mark.parametrize(

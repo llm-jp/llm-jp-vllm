@@ -134,6 +134,28 @@ def test_is_reasoning_end(
     assert reasoning_parser.is_reasoning_end(fake_tokenizer.encode(trace)) is expected
 
 
+def test_is_reasoning_end_streaming_tracks_cumulative_ids(
+    reasoning_parser, fake_tokenizer: FakeLlmjp4Tokenizer
+) -> None:
+    token_ids = fake_tokenizer.encode(
+        "<|channel|>analysis<|message|>Reasoning<|end|>"
+        + "<|start|>assistant<|channel|>final<|message|>Content"
+    )
+
+    # Structured-output engines pass cumulative ids each decode step
+    # without ever calling extract_reasoning_streaming.
+    results = [
+        reasoning_parser.is_reasoning_end_streaming(
+            token_ids[:step], token_ids[step - 1 : step]
+        )
+        for step in range(1, len(token_ids) + 1)
+    ]
+
+    assert results[0] is False
+    assert results[-1] is True
+    assert results == sorted(results)  # flips exactly once
+
+
 def test_streaming_splits_messages_and_records_the_content_handover(
     reasoning_parser, fake_tokenizer: FakeLlmjp4Tokenizer
 ) -> None:

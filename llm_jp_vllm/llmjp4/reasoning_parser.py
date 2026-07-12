@@ -3,7 +3,7 @@
 # but applies some modification.
 # https://github.com/llm-jp/vllm/blob/4383f1532e87e77b6f961e633230f47467cbd072/vllm/reasoning/gptoss_reasoning_parser.py#L65
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
@@ -63,6 +63,16 @@ class Llmjp4ReasoningParser(ReasoningParser):
         ):
             pass
         return last_message is not None and self._ends_reasoning(last_message)
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        # Structured-output engines call only this method, with cumulative
+        # ids, so the stream may still need advancing here; on the chat
+        # path extract_reasoning_streaming has already consumed the ids.
+        if self._stream.consumed != len(input_ids):
+            self._stream.advance(len(input_ids) - len(list(delta_ids)), input_ids)
+        return self._stream.content_started
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         # Returns everything from the <|start|> of the first non-analysis

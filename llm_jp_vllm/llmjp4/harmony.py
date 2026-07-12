@@ -377,6 +377,11 @@ class HarmonyStreamParser:
         self.calls: list[tuple[str, str]] = []
 
     @property
+    def consumed(self) -> int:
+        """Number of stream tokens consumed so far."""
+        return self._consumed
+
+    @property
     def content_started(self) -> bool:
         """Whether a message ending the reasoning phase has begun."""
         return self._content_start is not None

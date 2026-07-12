@@ -26,7 +26,7 @@ from llm_jp_vllm.llmjp4.harmony import (
     HarmonyHeader,
     HarmonyMessageKind,
     HarmonyMessageParser,
-    strip_incomplete_decode,
+    HarmonyStreamParser,
 )
 
 logger = init_logger(__name__)
@@ -56,8 +56,7 @@ class Llmjp4ToolParser(ToolParser):
             "<|start|>assistant", add_special_tokens=False
         )
 
-        self._sent_content_length: int = 0
-        self._sent_reasoning_length: int = 0
+        self._stream = HarmonyStreamParser(self._parser, self._prefill_ids)
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -96,7 +95,10 @@ class Llmjp4ToolParser(ToolParser):
         self, model_output: str, request: ChatCompletionRequest
     ) -> ExtractedToolCallInformation:
         try:
-            if "<|channel|>" not in model_output and "<|start|>" not in model_output:
+            if not any(
+                marker in model_output
+                for marker in ("<|channel|>", "<|start|>", "<|message|>")
+            ):
                 # adjust_request keeps the special tokens, so marker-less
                 # text is a plain answer.
                 return ExtractedToolCallInformation(
@@ -105,7 +107,7 @@ class Llmjp4ToolParser(ToolParser):
             token_ids = self.model_tokenizer.encode(
                 model_output, add_special_tokens=False
             )
-            calls, content, _ = self._split_messages(token_ids)
+            calls, content = self._split_messages(token_ids)
             return ExtractedToolCallInformation(
                 tools_called=bool(calls),
                 tool_calls=[
@@ -143,20 +145,14 @@ class Llmjp4ToolParser(ToolParser):
             if not previous_token_ids:
                 self._reset_streaming_state()
 
-            calls, content, reasoning = self._split_messages(list(current_token_ids))
+            reasoning_delta, content_delta = self._stream.advance(
+                len(previous_token_ids), current_token_ids
+            )
             tool_deltas = [
                 delta
-                for index, (header, body) in enumerate(calls)
-                for delta in self._tool_deltas_for(index, header, body)
+                for index, (name, arguments) in enumerate(self._stream.calls)
+                for delta in self._tool_deltas_for(index, name, arguments)
             ]
-            # Withhold partially decoded multi-byte characters (U+FFFD);
-            # they complete in a later step.
-            content = strip_incomplete_decode(content)
-            reasoning = strip_incomplete_decode(reasoning)
-            content_delta = content[self._sent_content_length :]
-            self._sent_content_length = len(content)
-            reasoning_delta = reasoning[self._sent_reasoning_length :]
-            self._sent_reasoning_length = len(reasoning)
 
             if not tool_deltas and not content_delta and not reasoning_delta:
                 return None
@@ -171,32 +167,28 @@ class Llmjp4ToolParser(ToolParser):
 
     def _split_messages(
         self, token_ids: list[int]
-    ) -> tuple[list[tuple[HarmonyHeader, str]], str, str]:
-        """Split parsed messages into tool calls, content and reasoning."""
+    ) -> tuple[list[tuple[HarmonyHeader, str]], str]:
+        """Split parsed messages into tool calls and content."""
         calls: list[tuple[HarmonyHeader, str]] = []
         content_parts: list[str] = []
-        reasoning_parts: list[str] = []
         for message in self._parser.get_all_messages(self._prefill_ids + token_ids):
             if message.content is None:
                 # Incomplete header; the function name may be truncated.
                 continue
             header = self._parser.parse_header(message)
-            body = self.model_tokenizer.decode(message.content.token_ids)
             if header.kind is HarmonyMessageKind.TOOL_CALL:
-                calls.append((header, body))
-            elif not body:
-                continue
+                calls.append(
+                    (header, self.model_tokenizer.decode(message.content.token_ids))
+                )
             elif header.kind is HarmonyMessageKind.CONTENT:
-                content_parts.append(body)
-            elif header.kind is HarmonyMessageKind.REASONING:
-                # Analysis reappearing after the switch to the tool phase
-                # (e.g. between parallel calls) still belongs to reasoning.
-                reasoning_parts.append(body)
+                body = self.model_tokenizer.decode(message.content.token_ids)
+                if body:
+                    content_parts.append(body)
         # Messages are joined by newlines like the gpt-oss parser.
-        return calls, "\n".join(content_parts), "\n".join(reasoning_parts)
+        return calls, "\n".join(content_parts)
 
     def _tool_deltas_for(
-        self, index: int, header: HarmonyHeader, body: str
+        self, index: int, name: str, arguments: str
     ) -> list[DeltaToolCall]:
         """Emit the unsent portion of one tool call and update the state."""
         deltas: list[DeltaToolCall] = []
@@ -205,7 +197,6 @@ class Llmjp4ToolParser(ToolParser):
             # id/type/name go out exactly once; the state entries must be
             # registered in the same step (the serving layer indexes
             # streamed_args_for_tool as soon as a call appears).
-            name = self._function_name(header)
             self.prev_tool_call_arr.append({"name": name, "arguments": ""})
             self.streamed_args_for_tool.append("")
             deltas.append(
@@ -217,9 +208,7 @@ class Llmjp4ToolParser(ToolParser):
                 )
             )
 
-        args_delta = strip_incomplete_decode(body)[
-            len(self.streamed_args_for_tool[index]) :
-        ]
+        args_delta = arguments[len(self.streamed_args_for_tool[index]) :]
         if args_delta:
             deltas.append(
                 DeltaToolCall(
@@ -227,23 +216,26 @@ class Llmjp4ToolParser(ToolParser):
                     function=DeltaFunctionCall(arguments=args_delta),
                 )
             )
-            self.streamed_args_for_tool[index] += args_delta
+            self.streamed_args_for_tool[index] = arguments
 
         # The serving layer flushes prev_tool_call_arr[i]["arguments"]
         # minus streamed_args_for_tool[i] at end of stream.
-        self.prev_tool_call_arr[index]["arguments"] = body
+        self.prev_tool_call_arr[index]["arguments"] = arguments or "{}"
         return deltas
 
     def _reset_streaming_state(self) -> None:
         self.prev_tool_call_arr: list[dict[str, str]] = []
         self.streamed_args_for_tool: list[str] = []
-        self._sent_content_length = 0
-        self._sent_reasoning_length = 0
+        self._stream = HarmonyStreamParser(self._parser, self._prefill_ids)
 
     def _normalize_arguments(self, raw: str) -> str:
         # Invalid JSON passes through unchanged; downstream evaluators
         # decide how to treat it.
         text = raw.strip()
+        if not text:
+            # Clients json.loads() the arguments even for parameterless
+            # calls.
+            return "{}"
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:

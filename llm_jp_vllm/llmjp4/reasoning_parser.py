@@ -19,7 +19,7 @@ from llm_jp_vllm.llmjp4.harmony import (
     HarmonyMessage,
     HarmonyMessageKind,
     HarmonyMessageParser,
-    strip_incomplete_decode,
+    HarmonyStreamParser,
 )
 
 
@@ -40,23 +40,21 @@ class Llmjp4ReasoningParser(ReasoningParser):
         )
 
         # The serving layer calls is_reasoning_end / extract_content_ids
-        # with per-step delta ids only; the boundary observed on the
-        # cumulative ids in extract_reasoning_streaming is recorded here.
-        self._streaming_reasoning_ended: bool = False
-        self._pending_content_ids: list[int] = []
+        # with per-step delta ids only; the reasoning boundary is tracked
+        # on this cumulative stream advanced in extract_reasoning_streaming.
+        self._stream = HarmonyStreamParser(self._parser, self._reasoning_prefill)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        if self._streaming_reasoning_ended:
+        if self._stream.content_started:
             return True
         # Only the last (still open) message can end the reasoning
         # prefix; completed final messages from previous turns in a
         # multi-turn prompt must not count.
-        last_message = next(
-            self._parser.reverse_iter_messages(
-                self._reasoning_prefill + list(input_ids)
-            ),
-            None,
-        )
+        last_message: HarmonyMessage | None = None
+        for last_message in self._parser.iter_messages(
+            self._reasoning_prefill + list(input_ids)
+        ):
+            pass
         return last_message is not None and self._ends_reasoning(last_message)
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
@@ -65,25 +63,30 @@ class Llmjp4ReasoningParser(ReasoningParser):
         start = self._content_start(input_ids)
         if start is not None:
             return input_ids[start:]
-        # input_ids may be a mid-message delta; use the recorded state.
-        if self._streaming_reasoning_ended:
-            return list(self._pending_content_ids)
-        return []
+        # input_ids may be a mid-message delta; use the streaming state.
+        return self._stream.content_ids
 
     def extract_reasoning(
         self,
         model_output: str,
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
-        if "<|channel|>" not in model_output and "<|start|>" not in model_output:
+        if not any(
+            marker in model_output
+            for marker in ("<|channel|>", "<|start|>", "<|message|>")
+        ):
             return self._extract_reasoning_from_stripped_text(model_output)
 
         token_ids = self.model_tokenizer.encode(model_output, add_special_tokens=False)
         # Analysis may reappear after the first content/tool message,
         # so reasoning is collected from the whole sequence.
-        reasoning, _ = self._classified_texts(token_ids)
+        reasoning, content = self._classified_texts(token_ids)
         start = self._content_start(token_ids)
-        return reasoning or None, self._content_text(token_ids, start)
+        if start is not None:
+            return reasoning or None, self._content_text(token_ids, start)
+        # No message properly ends the reasoning phase, but classified
+        # content (e.g. from a headerless message) must not be lost.
+        return reasoning or None, content or None
 
     def extract_reasoning_streaming(
         self,
@@ -94,30 +97,11 @@ class Llmjp4ReasoningParser(ReasoningParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
     ) -> DeltaMessage | None:
-        # A fresh stream may reuse this instance; drop recorded state.
-        if not previous_token_ids:
-            self._streaming_reasoning_ended = False
-            self._pending_content_ids = []
-
-        start = self._content_start(list(current_token_ids))
-        if start is not None:
-            self._streaming_reasoning_ended = True
-            self._pending_content_ids = list(current_token_ids[start:])
-
-        previous_reasoning, previous_content = self._classified_texts(
-            list(previous_token_ids)
+        # A fresh stream reusing this instance shows up as a mismatched
+        # previous length, which makes advance() rebuild from scratch.
+        reasoning_delta, content_delta = self._stream.advance(
+            len(previous_token_ids), current_token_ids
         )
-        current_reasoning, current_content = self._classified_texts(
-            list(current_token_ids)
-        )
-        # Withhold U+FFFD from partially decoded multi-byte characters;
-        # emitting it would corrupt the length-based delta.
-        reasoning_delta = strip_incomplete_decode(current_reasoning)[
-            len(strip_incomplete_decode(previous_reasoning)) :
-        ]
-        content_delta = strip_incomplete_decode(current_content)[
-            len(strip_incomplete_decode(previous_content)) :
-        ]
 
         if not reasoning_delta and not content_delta:
             return None
@@ -203,7 +187,8 @@ class Llmjp4ReasoningParser(ReasoningParser):
         reasoning_parts = [
             match.group(1).strip()
             for match in re.finditer(
-                r"(?:^|\bassistant\s+)analysis\s+(.*?)(?=\s+assistant\b|\s*$)",
+                r"(?:^|\bassistant\s+)analysis\s+(.*?)"
+                r"(?=\s+assistant\s+(?:analysis|commentary|final)\b|\s*$)",
                 model_output,
                 re.DOTALL,
             )

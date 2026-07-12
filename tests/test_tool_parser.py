@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from conftest import MULTIBYTE_PAIR_IDS, FakeLlmjp4Tokenizer
+from conftest import MULTIBYTE_CHAR_IDS, FakeLlmjp4Tokenizer
 
 pytest.importorskip("vllm")
 
@@ -48,17 +48,19 @@ def stream_tokens(
     tool_parser: Llmjp4ToolParser,
     chat_request: ChatCompletionRequest,
     content_ids: list[int],
+    chunk_size: int = 1,
 ) -> list[DeltaMessage]:
-    """Feed tokens one by one and collect the emitted deltas."""
+    """Feed tokens chunk by chunk and collect the emitted deltas."""
     deltas: list[DeltaMessage] = []
-    for step in range(1, len(content_ids) + 1):
+    for start in range(0, len(content_ids), chunk_size):
+        end = min(start + chunk_size, len(content_ids))
         delta = tool_parser.extract_tool_calls_streaming(
             previous_text="",
             current_text="",
             delta_text="",
-            previous_token_ids=content_ids[: step - 1],
-            current_token_ids=content_ids[:step],
-            delta_token_ids=content_ids[step - 1 : step],
+            previous_token_ids=content_ids[:start],
+            current_token_ids=content_ids[:end],
+            delta_token_ids=content_ids[start:end],
             request=chat_request,
         )
         if delta is not None:
@@ -84,20 +86,22 @@ def reconstruct_tool_calls(deltas: list[DeltaMessage]) -> list[tuple[str, str]]:
 @pytest.mark.parametrize(
     ("trace", "expected_calls"),
     [
-        (
-            SINGLE_TOOL_CALL_TRACE,
-            [("get_current_weather", '{"location": "Berlin"}')],
-        ),
-        (
+        pytest.param(
             PARALLEL_TOOL_CALL_TRACE,
             [
                 ("get_current_weather", '{"location": "Paris"}'),
                 ("get_current_time", '{"timezone": "Europe/London"}'),
                 ("get_current_weather", '{"location": "Berlin"}'),
             ],
+            id="parallel",
+        ),
+        pytest.param(
+            "<|start|>assistant to=functions.get_current_time"
+            + "<|channel|>commentary json<|message|><|call|>",
+            [("get_current_time", "{}")],
+            id="no-arguments",
         ),
     ],
-    ids=["single", "parallel"],
 )
 def test_extract_tool_calls(
     tool_parser, chat_request, trace: str, expected_calls: list[tuple[str, str]]
@@ -150,55 +154,99 @@ def test_streaming_delta_protocol(
     assert opened == [0, 1, 2]
 
 
-def test_streaming_routes_late_analysis_to_reasoning(
-    tool_parser, chat_request, fake_tokenizer: FakeLlmjp4Tokenizer
-) -> None:
-    # After the serving layer's one-way switch to the tool phase, an
-    # analysis message reaches only this parser.
-    deltas = stream_tokens(
-        tool_parser,
-        chat_request,
-        fake_tokenizer.encode(
+@pytest.mark.parametrize(
+    ("trace", "expected_calls", "expected_reasoning"),
+    [
+        # After the serving layer's one-way switch to the tool phase, an
+        # analysis message reaches only this parser.
+        pytest.param(
             "<|start|>assistant to=functions.get_current_weather"
             + '<|channel|>commentary json<|message|>{"location": "Berlin"}<|end|>'
-            + "<|start|>assistant<|channel|>analysis<|message|>Late reasoning"
+            + "<|start|>assistant<|channel|>analysis<|message|>Late reasoning",
+            [("get_current_weather", '{"location": "Berlin"}')],
+            "Late reasoning",
+            id="late-analysis-routes-to-reasoning",
         ),
-    )
+        pytest.param(
+            "<|start|>assistant to=functions.echo"
+            + '<|channel|>commentary json<|message|>{"text"'
+            + '<|message|>: "Hi"}<|call|>',
+            [("echo", '{"text": "Hi"}')],
+            "",
+            id="duplicate-message-marker-does-not-open-a-second-call",
+        ),
+        # The serving layer cannot flush "{}" for a call whose final
+        # step produced no delta; the parser must stream it.
+        pytest.param(
+            "<|start|>assistant to=functions.get_current_time"
+            + "<|channel|>commentary json<|message|><|call|>",
+            [("get_current_time", "{}")],
+            "",
+            id="empty-arguments-stream-as-json",
+        ),
+    ],
+)
+def test_streaming_reconstructs_tool_calls(
+    tool_parser,
+    chat_request,
+    fake_tokenizer: FakeLlmjp4Tokenizer,
+    trace: str,
+    expected_calls: list[tuple[str, str]],
+    expected_reasoning: str,
+) -> None:
+    deltas = stream_tokens(tool_parser, chat_request, fake_tokenizer.encode(trace))
 
-    assert "".join(delta.reasoning or "" for delta in deltas) == "Late reasoning"
-    assert reconstruct_tool_calls(deltas) == [
-        ("get_current_weather", '{"location": "Berlin"}')
-    ]
+    assert reconstruct_tool_calls(deltas) == expected_calls
+    assert "".join(delta.reasoning or "" for delta in deltas) == expected_reasoning
 
 
 def test_streaming_withholds_split_multibyte_in_arguments(
     tool_parser, chat_request, fake_tokenizer: FakeLlmjp4Tokenizer
 ) -> None:
+    # Premise: the ids are the byte tokens of "あ" (see conftest).
+    assert fake_tokenizer.decode(list(MULTIBYTE_CHAR_IDS)) == "あ"
+
     content_ids = (
         fake_tokenizer.encode(
             "<|start|>assistant to=functions.echo"
             + '<|channel|>commentary json<|message|>{"text": "'
         )
-        + list(MULTIBYTE_PAIR_IDS)
-        + fake_tokenizer.encode('"}<|call|>')
+        + list(MULTIBYTE_CHAR_IDS)
+        # Long enough for the incremental decode to continue past the
+        # multi-byte pair.
+        + fake_tokenizer.encode('yes"}<|call|>')
     )
 
     deltas = stream_tokens(tool_parser, chat_request, content_ids)
 
-    assert reconstruct_tool_calls(deltas) == [("echo", '{"text": "あ"}')]
+    assert reconstruct_tool_calls(deltas) == [("echo", '{"text": "あyes"}')]
+
+
+def test_streaming_state_resets_between_streams(
+    tool_parser, chat_request, fake_tokenizer: FakeLlmjp4Tokenizer
+) -> None:
+    content_ids = fake_tokenizer.encode(SINGLE_TOOL_CALL_TRACE)
+    stream_tokens(tool_parser, chat_request, content_ids)
+
+    deltas = stream_tokens(tool_parser, chat_request, content_ids)
+
+    assert reconstruct_tool_calls(deltas) == [
+        ("get_current_weather", '{"location": "Berlin"}')
+    ]
+    assert len(tool_parser.prev_tool_call_arr) == 1
 
 
 @pytest.mark.parametrize(
-    "trace",
-    [SINGLE_TOOL_CALL_TRACE, PARALLEL_TOOL_CALL_TRACE],
-    ids=["single", "parallel"],
+    "chunk_size",
+    [pytest.param(1, id="token-by-token"), pytest.param(3, id="chunked")],
 )
 def test_streaming_matches_non_streaming(
     tool_parser,
     chat_request,
     fake_tokenizer: FakeLlmjp4Tokenizer,
-    trace: str,
+    chunk_size: int,
 ) -> None:
+    trace = PARALLEL_TOOL_CALL_TRACE
     # Equivalence test: the expected values are the non-streaming results.
     reasoning_parser = Llmjp4ReasoningParser(fake_tokenizer)
     full_ids = fake_tokenizer.encode(trace)
@@ -214,7 +262,7 @@ def test_streaming_matches_non_streaming(
     assert content_ids
     content_ids = content_ids + full_ids[switch_step:]
 
-    deltas = stream_tokens(tool_parser, chat_request, content_ids)
+    deltas = stream_tokens(tool_parser, chat_request, content_ids, chunk_size)
 
     expected = tool_parser.extract_tool_calls(trace, chat_request)
     assert [

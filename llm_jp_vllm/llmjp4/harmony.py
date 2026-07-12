@@ -16,12 +16,6 @@ FUNCTION_NAMESPACE = "functions."
 _RECIPIENT_PREFIX = "to="
 
 
-def strip_incomplete_decode(text: str) -> str:
-    """Drop the trailing U+FFFD of a partially decoded multi-byte
-    character; streaming callers withhold it until it completes."""
-    return text.rstrip("�")
-
-
 class HarmonyMessageEndType(Enum):
     INCOMPLETE = 0
     END = 1
@@ -87,12 +81,13 @@ class HarmonyHeader:
     @property
     def kind(self) -> HarmonyMessageKind:
         """Classification of the message this header belongs to."""
-        if self.recipient is not None:
-            if self.recipient.startswith(FUNCTION_NAMESPACE):
-                return HarmonyMessageKind.TOOL_CALL
-            return HarmonyMessageKind.IGNORE
+        if self.recipient is not None and self.recipient.startswith(FUNCTION_NAMESPACE):
+            return HarmonyMessageKind.TOOL_CALL
         if self.channel == "analysis":
             return HarmonyMessageKind.REASONING
+        if self.recipient is not None and self.channel != "final":
+            # Built-in tool recipients such as "python" or "browser.*".
+            return HarmonyMessageKind.IGNORE
         return HarmonyMessageKind.CONTENT
 
 
@@ -245,3 +240,212 @@ class HarmonyMessageParser:
             if token_ids[i] == self._start_id:
                 yield next(self.iter_messages(token_ids[i:end_position]))
                 end_position = i
+
+
+class HarmonyStreamLexer:
+    """Streaming lexer for Harmony messages, modeled on openai/harmony's
+    ``StreamableParser``: header tokens accumulate until <|message|>,
+    where the parsed header is reported to the sink once; body text is
+    then decoded incrementally and emitted as soon as it is complete.
+    Message kinds are the sink's concern.
+
+    Body decoding uses the two-offset scheme of vLLM's incremental
+    detokenization: the decode window always starts where a previous
+    clean decode ended, so byte-fallback runs are never split mid-run,
+    and a delta ending in U+FFFD (a partially decoded multi-byte
+    character) is withheld until it completes.
+    """
+
+    def __init__(
+        self,
+        parser: HarmonyMessageParser,
+        sink: "HarmonyStreamParser",
+        prefill_ids: Sequence[int],
+    ):
+        self._parser = parser
+        self._tokenizer = parser._tokenizer
+        self._sink = sink
+        self._count: int = 0
+        self._message_start: int = 0
+        # Message-scoped state, reset at every message boundary.
+        self._section: str | None = None
+        self._sections: dict[str, list[int]] = {}
+        self._header: HarmonyHeader | None = None
+        self._body_ids: list[int] = []
+        self._prefix_offset: int = 0
+        self._read_offset: int = 0
+        self._prefix_text: str = ""
+        for token_id in prefill_ids:
+            self.push(token_id)
+        # The prefill belongs to the prompt, not the generation; the
+        # positions reported to the sink count generated tokens only.
+        self._count = 0
+        self._message_start = 0
+
+    def push(self, token_id: int) -> None:
+        begin = self._parser._begin_map.get(token_id)
+        if begin == "role":
+            # <|start|> always delimits messages (as reverse_iter_messages
+            # assumes); a missing end token must not merge two messages.
+            self._finish_message()
+        self._count += 1
+        if begin is not None:
+            if self._header is not None:
+                # A marker after <|message|> cannot reclassify a message
+                # whose text was already emitted.
+                return
+            if begin == "content":
+                self._header = self._parser.parse_header(
+                    HarmonyMessage(
+                        end=HarmonyMessageEndType.INCOMPLETE,
+                        **{
+                            # Start positions are unused on this path.
+                            name: HarmonySequence(token_ids=ids, start=0)
+                            for name, ids in self._sections.items()
+                        },
+                    )
+                )
+                self._sink.begin_message(self._header, self._message_start)
+            else:
+                self._section = begin
+                self._sections[begin] = []
+        elif token_id in self._parser._end_map:
+            self._finish_message()
+        elif self._header is not None:
+            self._push_body(token_id)
+        elif self._section is not None:
+            self._sections[self._section].append(token_id)
+
+    def _push_body(self, token_id: int) -> None:
+        self._body_ids.append(token_id)
+        delta = self._pending_text()
+        if delta and not delta.endswith("�"):
+            self._prefix_offset = self._read_offset
+            self._read_offset = len(self._body_ids)
+            self._prefix_text = self._tokenizer.decode(
+                self._body_ids[self._prefix_offset :]
+            )
+            self._sink.body_text(delta)
+
+    def _pending_text(self) -> str:
+        new_text = self._tokenizer.decode(self._body_ids[self._prefix_offset :])
+        return new_text[len(self._prefix_text) :]
+
+    def _finish_message(self) -> None:
+        if self._header is not None:
+            # A message that ends mid-character emits the partial
+            # character now; nothing will complete it anymore.
+            self._sink.end_message(self._pending_text())
+        self._section = None
+        self._sections = {}
+        self._header = None
+        self._body_ids = []
+        self._prefix_offset = 0
+        self._read_offset = 0
+        self._prefix_text = ""
+        self._message_start = self._count
+
+
+class HarmonyStreamParser:
+    """Routes the lexed message stream into reasoning/content text,
+    tool calls and the handover ids, mirroring how vLLM's gpt-oss
+    integration classifies ``StreamableParser`` output into segments.
+
+    Re-parsing the cumulative sequence every step would be O(N^2) over
+    a stream; advancing the lexer over the unseen tokens keeps each
+    step O(delta).
+    """
+
+    def __init__(self, parser: HarmonyMessageParser, prefill_ids: Sequence[int]):
+        self._parser = parser
+        self._prefill_ids = list(prefill_ids)
+        self._reset()
+
+    def _reset(self) -> None:
+        self._lexer = HarmonyStreamLexer(self._parser, self, self._prefill_ids)
+        self._consumed: int = 0
+        self._ids: list[int] = []
+        self._content_start: int | None = None
+        # The open message's kind, and the pending newline that joins
+        # messages like the gpt-oss parser (skipping empty ones).
+        self._kind: HarmonyMessageKind | None = None
+        self._separator: str = ""
+        self._reasoning_parts: list[str] = []
+        self._content_parts: list[str] = []
+        self._reasoning_seen: bool = False
+        self._content_seen: bool = False
+        self.calls: list[tuple[str, str]] = []
+
+    @property
+    def content_started(self) -> bool:
+        """Whether a message ending the reasoning phase has begun."""
+        return self._content_start is not None
+
+    @property
+    def content_ids(self) -> list[int]:
+        """Tokens from the first non-reasoning message on, for the tool
+        parser handover."""
+        if self._content_start is None:
+            return []
+        return self._ids[self._content_start :]
+
+    def advance(self, previous_len: int, current_ids: Sequence[int]) -> tuple[str, str]:
+        """Consume the tokens beyond ``previous_len`` and return the new
+        (reasoning, content) text."""
+        if previous_len != self._consumed:
+            # The caller broke the cumulative-stream contract (a fresh
+            # request reusing this instance, or interleaved n>1 choices);
+            # rebuilding once is cheaper than misclassifying.
+            self._reset()
+        for token_id in current_ids[self._consumed :]:
+            self._ids.append(token_id)
+            self._lexer.push(token_id)
+        self._consumed = len(current_ids)
+        reasoning = "".join(self._reasoning_parts)
+        content = "".join(self._content_parts)
+        self._reasoning_parts.clear()
+        self._content_parts.clear()
+        return reasoning, content
+
+    def begin_message(self, header: HarmonyHeader, start: int) -> None:
+        self._kind = header.kind
+        if header.kind is HarmonyMessageKind.TOOL_CALL:
+            assert header.recipient is not None  # guaranteed by TOOL_CALL kind
+            self.calls.append((header.recipient[len(FUNCTION_NAMESPACE) :], ""))
+        elif header.kind is HarmonyMessageKind.REASONING:
+            self._separator = "\n" if self._reasoning_seen else ""
+        elif header.kind is HarmonyMessageKind.CONTENT:
+            self._separator = "\n" if self._content_seen else ""
+        if (
+            self._content_start is None
+            and header.kind
+            in (HarmonyMessageKind.CONTENT, HarmonyMessageKind.TOOL_CALL)
+            # A headerless fragment must not end the reasoning phase,
+            # mirroring the reasoning parser's _ends_reasoning.
+            and (header.channel is not None or header.recipient is not None)
+        ):
+            self._content_start = start
+
+    def body_text(self, delta: str) -> None:
+        if not delta:
+            return
+        if self._kind is HarmonyMessageKind.TOOL_CALL:
+            name, arguments = self.calls[-1]
+            self.calls[-1] = (name, arguments + delta)
+        elif self._kind is HarmonyMessageKind.REASONING:
+            self._reasoning_parts.append(self._separator + delta)
+            self._separator = ""
+            self._reasoning_seen = True
+        elif self._kind is HarmonyMessageKind.CONTENT:
+            self._content_parts.append(self._separator + delta)
+            self._separator = ""
+            self._content_seen = True
+
+    def end_message(self, tail: str) -> None:
+        self.body_text(tail)
+        if self._kind is HarmonyMessageKind.TOOL_CALL and not self.calls[-1][1]:
+            # The serving layer flushes unstreamed arguments only onto an
+            # existing tool-call delta, so a parameterless call must
+            # stream its "{}" itself.
+            self.calls[-1] = (self.calls[-1][0], "{}")
+        self._kind = None

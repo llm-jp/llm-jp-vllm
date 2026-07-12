@@ -22,9 +22,12 @@ _WORD_TOKEN_IDS: dict[str, int] = {
     "final": 2520,
 }
 
-# Byte-fallback simulation: the first id alone decodes to U+FFFD, the
-# pair to the complete character "あ".
-MULTIBYTE_PAIR_IDS: tuple[int, int] = (900, 901)
+# Byte-fallback simulation: the three ids are the bytes of "あ". Like
+# real byte-fallback, decode handles a run of byte tokens atomically —
+# a malformed run decodes to one U+FFFD per byte.
+MULTIBYTE_CHAR_IDS: tuple[int, int, int] = (900, 901, 902)
+
+_MULTIBYTE_ID_SET = frozenset(MULTIBYTE_CHAR_IDS)
 
 
 class FakeLlmjp4Tokenizer:
@@ -65,13 +68,23 @@ class FakeLlmjp4Tokenizer:
         parts: list[str] = []
         position = 0
         while position < len(token_ids):
-            if token_ids[position] == MULTIBYTE_PAIR_IDS[0]:
-                if token_ids[position + 1 : position + 2] == [MULTIBYTE_PAIR_IDS[1]]:
-                    parts.append("あ")
-                    position += 2
+            if token_ids[position] in _MULTIBYTE_ID_SET:
+                # Real byte-fallback decodes a run of consecutive byte
+                # tokens as one unit: adding one byte can invalidate the
+                # whole run (decode([E3,81,82,E3]) is 4x U+FFFD, not
+                # "あ" + U+FFFD).
+                run_end = position
+                while (
+                    run_end < len(token_ids) and token_ids[run_end] in _MULTIBYTE_ID_SET
+                ):
+                    run_end += 1
+                run = token_ids[position:run_end]
+                chars = len(run) // len(MULTIBYTE_CHAR_IDS)
+                if run == list(MULTIBYTE_CHAR_IDS) * chars:
+                    parts.append("あ" * chars)
                 else:
-                    parts.append("�")
-                    position += 1
+                    parts.append("�" * len(run))
+                position = run_end
                 continue
             parts.append(self._id_to_token[token_ids[position]])
             position += 1

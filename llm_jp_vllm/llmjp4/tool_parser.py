@@ -52,9 +52,10 @@ class Llmjp4ToolParser(ToolParser):
         self._parser = HarmonyMessageParser(tokenizer)
         self._call_id: int = vocab["<|call|>"]
         self._return_id: int = vocab["<|return|>"]
-        self._prefill_ids: list[int] = tokenizer.encode(
-            "<|start|>assistant", add_special_tokens=False
-        )
+        # Literal ids of tokenizer.encode("<|start|>assistant"):
+        # NOTE(odashi): Prevent accessing to tokenizer methods
+        # https://zenn.dev/yay1/articles/ad6958086670b0
+        self._prefill_ids: list[int] = [10, 12811]
 
         self._stream = HarmonyStreamParser(self._parser, self._prefill_ids)
 

@@ -31,12 +31,11 @@ class Llmjp4ReasoningParser(ReasoningParser):
 
         self._parser = HarmonyMessageParser(tokenizer)
         # Generation resumes after this prefill, so the first generated
-        # message has no <|start|> of its own. Encoded once here:
+        # message has no <|start|> of its own. Literal ids of
+        # tokenizer.encode("<|start|>assistant"):
         # NOTE(odashi): Prevent accessing to tokenizer methods
         # https://zenn.dev/yay1/articles/ad6958086670b0
-        self._reasoning_prefill: list[int] = tokenizer.encode(
-            "<|start|>assistant", add_special_tokens=False
-        )
+        self._reasoning_prefill: list[int] = [10, 12811]
 
         # The serving layer calls is_reasoning_end / extract_content_ids
         # with per-step delta ids only; the reasoning boundary is tracked

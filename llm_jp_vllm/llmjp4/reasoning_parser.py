@@ -15,10 +15,12 @@ from vllm.reasoning.abs_reasoning_parsers import (
 from vllm.tokenizers import TokenizerLike
 
 from llm_jp_vllm.llmjp4.harmony import (
+    HarmonyHeader,
     HarmonyMessage,
     HarmonyMessageKind,
     HarmonyMessageParser,
     HarmonyStreamParser,
+    iter_text_messages,
 )
 
 
@@ -61,7 +63,7 @@ class Llmjp4ReasoningParser(ReasoningParser):
             self._reasoning_prefill + list(input_ids)
         ):
             pass
-        return last_message is not None and self._ends_reasoning(last_message)
+        return last_message is not None and self._message_ends_reasoning(last_message)
 
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
@@ -95,15 +97,38 @@ class Llmjp4ReasoningParser(ReasoningParser):
             # text is a plain answer.
             return None, model_output
 
-        token_ids = self.model_tokenizer.encode(model_output, add_special_tokens=False)
+        # The output text is lexed directly; re-encoding it would touch
+        # the tokenizer's mutable state (see the NOTE in __init__).
+        messages = list(iter_text_messages(model_output))
         # Analysis may reappear after the first content/tool message,
         # so reasoning is collected from the whole sequence.
-        reasoning, content = self._classified_texts(token_ids)
-        start = self._content_start(token_ids)
-        if start is not None:
-            return reasoning or None, self._content_text(token_ids, start)
-        # No message properly ends the reasoning phase, but classified
-        # content (e.g. from a headerless message) must not be lost.
+        reasoning = "\n".join(
+            message.body
+            for message in messages
+            if message.header.kind is HarmonyMessageKind.REASONING and message.body
+        )
+        offset = next(
+            (
+                message.start_offset
+                for message in messages
+                if self._ends_reasoning(message.header)
+            ),
+            None,
+        )
+        if offset is not None and any(
+            message.header.kind is HarmonyMessageKind.TOOL_CALL for message in messages
+        ):
+            # The tool parser re-parses this text and needs the raw markers.
+            return reasoning or None, model_output[offset:]
+        # When no message properly ends the reasoning phase, classified
+        # content (e.g. from a headerless message) must still not be lost.
+        content = "\n".join(
+            message.body
+            for message in messages
+            if message.header.kind is HarmonyMessageKind.CONTENT
+            and message.body
+            and (offset is None or message.start_offset >= offset)
+        )
         return reasoning or None, content or None
 
     def extract_reasoning_streaming(
@@ -128,11 +153,13 @@ class Llmjp4ReasoningParser(ReasoningParser):
             content=content_delta or None,
         )
 
-    def _ends_reasoning(self, message: HarmonyMessage) -> bool:
-        if message.content is None:
-            # The header is still incomplete: <|message|> has not appeared.
-            return False
-        header = self._parser.parse_header(message)
+    def _message_ends_reasoning(self, message: HarmonyMessage) -> bool:
+        # The header is still incomplete until <|message|> appears.
+        return message.content is not None and self._ends_reasoning(
+            self._parser.parse_header(message)
+        )
+
+    def _ends_reasoning(self, header: HarmonyHeader) -> bool:
         if header.channel is None and header.recipient is None:
             # A mid-message fragment (single-step delta) has no header to
             # classify.
@@ -142,55 +169,12 @@ class Llmjp4ReasoningParser(ReasoningParser):
         # calls happen while reasoning.
         return header.kind in (HarmonyMessageKind.CONTENT, HarmonyMessageKind.TOOL_CALL)
 
-    def _content_text(self, token_ids: list[int], start: int | None) -> str | None:
-        """User-visible content of the ids from ``start`` on."""
-        if start is None:
-            return None
-        content_ids = token_ids[start:]
-        if self._has_tool_call(content_ids):
-            # The tool parser re-parses this text and needs the raw markers.
-            return self.model_tokenizer.decode(content_ids)
-        # Plain answers reach the client without tool-parser cleanup,
-        # so the markers must be dropped here.
-        _, content = self._classified_texts(content_ids)
-        return content or None
-
-    def _has_tool_call(self, token_ids: list[int]) -> bool:
-        return any(
-            message.content is not None
-            and self._parser.parse_header(message).kind is HarmonyMessageKind.TOOL_CALL
-            for message in self._parser.iter_messages(
-                self._reasoning_prefill + list(token_ids)
-            )
-        )
-
     def _content_start(self, input_ids: list[int]) -> int | None:
         """Position where the first non-analysis message starts."""
         # Prepending is harmless even when input_ids already starts
         # with <|start|>.
         padded = self._reasoning_prefill + list(input_ids)
         for message in self._parser.iter_messages(padded):
-            if self._ends_reasoning(message):
+            if self._message_ends_reasoning(message):
                 return max(message.start - len(self._reasoning_prefill), 0)
         return None
-
-    def _classified_texts(self, token_ids: list[int]) -> tuple[str, str]:
-        """Reasoning/content texts of a token sequence, with messages
-        joined by newlines like the gpt-oss parser."""
-        # Tool-call bodies are excluded; they belong to the tool parser.
-        reasoning_parts: list[str] = []
-        content_parts: list[str] = []
-        for message in self._parser.iter_messages(
-            self._reasoning_prefill + list(token_ids)
-        ):
-            if message.content is None:
-                continue
-            text = self.model_tokenizer.decode(message.content.token_ids)
-            if not text:
-                continue
-            kind = self._parser.parse_header(message).kind
-            if kind is HarmonyMessageKind.REASONING:
-                reasoning_parts.append(text)
-            elif kind is HarmonyMessageKind.CONTENT:
-                content_parts.append(text)
-        return "\n".join(reasoning_parts), "\n".join(content_parts)

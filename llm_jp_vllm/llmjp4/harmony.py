@@ -2,6 +2,7 @@
 # This is basically identical with the bundled parser in LLM-jp-4 models,
 # but typing annotation is modified to follow vLLM standards.
 
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Iterator, Sequence
@@ -91,6 +92,119 @@ class HarmonyHeader:
         return HarmonyMessageKind.CONTENT
 
 
+def _header_from_words(
+    role_words: list[str],
+    channel_words: list[str],
+    constrain_words: list[str],
+) -> HarmonyHeader:
+    """Build a header from whitespace-split section words.
+
+    Follows openai/harmony's ``parse_header_from_string``: recipient
+    ("to=...") and content-type are read from the tail of the header
+    words, so a recipient is recognized on both sides of <|channel|>
+    (the LLM-jp-4 template and official examples place it differently).
+    """
+    role = role_words[0] if role_words else None
+    channel = channel_words[0] if channel_words else None
+    parts = role_words[1:] + channel_words[1:]
+
+    recipient: str | None = None
+    content_type: str | None = None
+    if parts:
+        last = parts[-1]
+        if last.startswith(_RECIPIENT_PREFIX):
+            recipient = last[len(_RECIPIENT_PREFIX) :]
+        elif len(parts) == 1:
+            # A single word that is not "to=..." is a bare recipient.
+            recipient = last
+        else:
+            # e.g. "to=functions.x json": content-type last, recipient before it
+            content_type = last
+            recipient = parts[-2].removeprefix(_RECIPIENT_PREFIX)
+
+    if constrain_words:
+        content_type = constrain_words[0]
+
+    return HarmonyHeader(
+        role=role,
+        channel=channel,
+        recipient=recipient,
+        content_type=content_type,
+    )
+
+
+@dataclass(frozen=True)
+class HarmonyTextMessage:
+    """A Harmony message lexed from decoded output text."""
+
+    header: HarmonyHeader
+    body: str
+    start_offset: int  # Character offset of the message start in the text.
+
+
+_MARKER_RE = re.compile(r"<\|(?:start|channel|constrain|message|end|return|call)\|>")
+
+_END_MARKERS = frozenset({"<|end|>", "<|return|>", "<|call|>"})
+
+
+def iter_text_messages(text: str) -> Iterator[HarmonyTextMessage]:
+    """Lex decoded model output into Harmony messages.
+
+    Applies the same rules as ``HarmonyStreamLexer``: <|start|> always
+    delimits messages, a marker after <|message|> cannot reclassify a
+    message, and a message whose header never reaches <|message|> is
+    dropped. The text is assumed to continue the "<|start|>assistant"
+    prefill, so the first message's role is pre-seeded.
+    """
+    sections: dict[str, str] = {"role": "assistant"}
+    section: str | None = "role"
+    header: HarmonyHeader | None = None
+    body_parts: list[str] = []
+    message_start = 0
+    position = 0
+
+    for match in _MARKER_RE.finditer(text):
+        segment = text[position : match.start()]
+        position = match.end()
+        if header is not None:
+            body_parts.append(segment)
+        elif section is not None:
+            sections[section] = sections.get(section, "") + segment
+
+        marker = match.group()
+        if marker == "<|start|>" or marker in _END_MARKERS:
+            if header is not None:
+                yield HarmonyTextMessage(header, "".join(body_parts), message_start)
+            sections = {}
+            header = None
+            body_parts = []
+            if marker == "<|start|>":
+                # <|start|> always delimits messages; a missing end token
+                # must not merge two messages.
+                section = "role"
+                message_start = match.start()
+            else:
+                section = None
+                message_start = position
+        elif header is not None:
+            # A marker after <|message|> cannot reclassify a message
+            # whose text was already collected.
+            pass
+        elif marker == "<|message|>":
+            header = _header_from_words(
+                sections.get("role", "").split(),
+                sections.get("channel", "").split(),
+                sections.get("constrain", "").split(),
+            )
+        else:
+            section = "channel" if marker == "<|channel|>" else "constrain"
+            sections[section] = ""
+
+    if header is not None:
+        body_parts.append(text[position:])
+        yield HarmonyTextMessage(header, "".join(body_parts), message_start)
+
+
 class HarmonyMessageParser:
     """A parser that performs lexical analysis to extract Harmony messages."""
 
@@ -111,43 +225,11 @@ class HarmonyMessageParser:
         }
 
     def parse_header(self, message: HarmonyMessage) -> HarmonyHeader:
-        """Parse the header sections of a message into structured metadata.
-
-        Follows openai/harmony's `parse_header_from_string`: recipient
-        ("to=...") and content-type are read from the tail of the header
-        words, so a recipient is recognized on both sides of <|channel|>
-        (the LLM-jp-4 template and official examples place it differently).
-        """
-        role_words = self._section_words(message.role)
-        channel_words = self._section_words(message.channel)
-
-        role = role_words[0] if role_words else None
-        channel = channel_words[0] if channel_words else None
-        parts = role_words[1:] + channel_words[1:]
-
-        recipient: str | None = None
-        content_type: str | None = None
-        if parts:
-            last = parts[-1]
-            if last.startswith(_RECIPIENT_PREFIX):
-                recipient = last[len(_RECIPIENT_PREFIX) :]
-            elif len(parts) == 1:
-                # A single word that is not "to=..." is a bare recipient.
-                recipient = last
-            else:
-                # e.g. "to=functions.x json": content-type last, recipient before it
-                content_type = last
-                recipient = parts[-2].removeprefix(_RECIPIENT_PREFIX)
-
-        constrain_words = self._section_words(message.constrain)
-        if constrain_words:
-            content_type = constrain_words[0]
-
-        return HarmonyHeader(
-            role=role,
-            channel=channel,
-            recipient=recipient,
-            content_type=content_type,
+        """Parse the header sections of a message into structured metadata."""
+        return _header_from_words(
+            self._section_words(message.role),
+            self._section_words(message.channel),
+            self._section_words(message.constrain),
         )
 
     def _section_words(self, section: HarmonySequence | None) -> list[str]:

@@ -27,6 +27,7 @@ from llm_jp_vllm.llmjp4.harmony import (
     HarmonyMessageKind,
     HarmonyMessageParser,
     HarmonyStreamParser,
+    iter_text_messages,
 )
 
 logger = init_logger(__name__)
@@ -105,24 +106,29 @@ class Llmjp4ToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=False, tool_calls=[], content=model_output
                 )
-            token_ids = self.model_tokenizer.encode(
-                model_output, add_special_tokens=False
-            )
-            calls, content = self._split_messages(token_ids)
-            return ExtractedToolCallInformation(
-                tools_called=bool(calls),
-                tool_calls=[
-                    ToolCall(
-                        id=make_tool_call_id(),
-                        type="function",
-                        function=FunctionCall(
-                            name=self._function_name(header),
-                            arguments=self._normalize_arguments(body),
-                        ),
+            # The output text is lexed directly; re-encoding it would
+            # touch the tokenizer's mutable state.
+            tool_calls: list[ToolCall] = []
+            content_parts: list[str] = []
+            for message in iter_text_messages(model_output):
+                if message.header.kind is HarmonyMessageKind.TOOL_CALL:
+                    tool_calls.append(
+                        ToolCall(
+                            id=make_tool_call_id(),
+                            type="function",
+                            function=FunctionCall(
+                                name=self._function_name(message.header),
+                                arguments=self._normalize_arguments(message.body),
+                            ),
+                        )
                     )
-                    for header, body in calls
-                ],
-                content=content or None,
+                elif message.header.kind is HarmonyMessageKind.CONTENT and message.body:
+                    content_parts.append(message.body)
+            return ExtractedToolCallInformation(
+                tools_called=bool(tool_calls),
+                tool_calls=tool_calls,
+                # Messages are joined by newlines like the gpt-oss parser.
+                content="\n".join(content_parts) or None,
             )
         except Exception:
             logger.exception("Failed to extract tool calls.")
@@ -165,28 +171,6 @@ class Llmjp4ToolParser(ToolParser):
         except Exception:
             logger.exception("Error in streaming tool call extraction.")
             return None
-
-    def _split_messages(
-        self, token_ids: list[int]
-    ) -> tuple[list[tuple[HarmonyHeader, str]], str]:
-        """Split parsed messages into tool calls and content."""
-        calls: list[tuple[HarmonyHeader, str]] = []
-        content_parts: list[str] = []
-        for message in self._parser.get_all_messages(self._prefill_ids + token_ids):
-            if message.content is None:
-                # Incomplete header; the function name may be truncated.
-                continue
-            header = self._parser.parse_header(message)
-            if header.kind is HarmonyMessageKind.TOOL_CALL:
-                calls.append(
-                    (header, self.model_tokenizer.decode(message.content.token_ids))
-                )
-            elif header.kind is HarmonyMessageKind.CONTENT:
-                body = self.model_tokenizer.decode(message.content.token_ids)
-                if body:
-                    content_parts.append(body)
-        # Messages are joined by newlines like the gpt-oss parser.
-        return calls, "\n".join(content_parts)
 
     def _tool_deltas_for(
         self, index: int, name: str, arguments: str

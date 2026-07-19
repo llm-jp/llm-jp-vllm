@@ -3,7 +3,7 @@
 # but typing annotation is modified to follow vLLM standards.
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Iterator, Sequence
 
@@ -12,9 +12,7 @@ from vllm.tokenizers import TokenizerLike
 # Tool calls are addressed to the "functions" namespace; other recipients
 # (browser.*, python, ...) are built-in tools that must not be converted
 # into OpenAI tool_calls.
-FUNCTION_NAMESPACE = "functions."
-
-_RECIPIENT_PREFIX = "to="
+_FUNCTION_NAMESPACE = "functions."
 
 
 class HarmonyMessageEndType(Enum):
@@ -51,14 +49,12 @@ class HarmonyMessage:
     channel: HarmonySequence | None = None
     constrain: HarmonySequence | None = None
     content: HarmonySequence | None = None
+    # Position of the message's <|start|> in the parsed sequence: section
+    # starts point just after their marker token; 0 when the message
+    # opens the sequence without a <|start|>.
+    start_position: int = field(init=False)
 
-    @property
-    def start(self) -> int:
-        """Position of the message's <|start|> in the parsed sequence.
-
-        Section starts point just after their marker token; 0 when the
-        message opens the sequence without a <|start|>.
-        """
+    def __post_init__(self) -> None:
         first_section = min(
             (
                 section.start
@@ -67,7 +63,7 @@ class HarmonyMessage:
             ),
             default=1,
         )
-        return max(first_section - 1, 0)
+        object.__setattr__(self, "start_position", max(first_section - 1, 0))
 
 
 @dataclass(frozen=True)
@@ -77,19 +73,30 @@ class HarmonyHeader:
     role: str | None = None
     channel: str | None = None
     recipient: str | None = None
-    content_type: str | None = None
+    # Called "content type" by openai/harmony; named after the marker here.
+    constrain: str | None = None
+    # Classification of the message this header belongs to.
+    kind: HarmonyMessageKind = field(init=False)
 
-    @property
-    def kind(self) -> HarmonyMessageKind:
-        """Classification of the message this header belongs to."""
-        if self.recipient is not None and self.recipient.startswith(FUNCTION_NAMESPACE):
-            return HarmonyMessageKind.TOOL_CALL
-        if self.channel == "analysis":
-            return HarmonyMessageKind.REASONING
-        if self.recipient is not None and self.channel != "final":
+    def __post_init__(self) -> None:
+        if self.recipient is not None and self.recipient.startswith(
+            _FUNCTION_NAMESPACE
+        ):
+            kind = HarmonyMessageKind.TOOL_CALL
+        elif self.channel == "analysis":
+            kind = HarmonyMessageKind.REASONING
+        elif self.recipient is not None and self.channel != "final":
             # Built-in tool recipients such as "python" or "browser.*".
-            return HarmonyMessageKind.IGNORE
-        return HarmonyMessageKind.CONTENT
+            kind = HarmonyMessageKind.IGNORE
+        else:
+            kind = HarmonyMessageKind.CONTENT
+        object.__setattr__(self, "kind", kind)
+
+
+def function_name(header: HarmonyHeader) -> str:
+    """Tool function name addressed by a TOOL_CALL message's recipient."""
+    assert header.recipient is not None  # guaranteed by the TOOL_CALL kind
+    return header.recipient[len(_FUNCTION_NAMESPACE) :]
 
 
 def _header_from_words(
@@ -97,39 +104,43 @@ def _header_from_words(
     channel_words: list[str],
     constrain_words: list[str],
 ) -> HarmonyHeader:
-    """Build a header from whitespace-split section words.
+    """Build a header from the whitespace-split words of each section.
 
-    Follows openai/harmony's ``parse_header_from_string``: recipient
-    ("to=...") and content-type are read from the tail of the header
-    words, so a recipient is recognized on both sides of <|channel|>
-    (the LLM-jp-4 template and official examples place it differently).
+    Header sections carry space-separated words (the tokenizer preserves
+    the spaces of the header text), so splitting on whitespace recovers
+    them. Follows openai/harmony's ``parse_header_from_string``:
+    recipient ("to=...") and content type are read from the tail of the
+    header words, so a recipient is recognized on both sides of
+    <|channel|> (the LLM-jp-4 template and official examples place it
+    differently).
     """
+    recipient_prefix = "to="
     role = role_words[0] if role_words else None
     channel = channel_words[0] if channel_words else None
     parts = role_words[1:] + channel_words[1:]
 
     recipient: str | None = None
-    content_type: str | None = None
+    constrain: str | None = None
     if parts:
         last = parts[-1]
-        if last.startswith(_RECIPIENT_PREFIX):
-            recipient = last[len(_RECIPIENT_PREFIX) :]
+        if last.startswith(recipient_prefix):
+            recipient = last[len(recipient_prefix) :]
         elif len(parts) == 1:
             # A single word that is not "to=..." is a bare recipient.
             recipient = last
         else:
-            # e.g. "to=functions.x json": content-type last, recipient before it
-            content_type = last
-            recipient = parts[-2].removeprefix(_RECIPIENT_PREFIX)
+            # e.g. "to=functions.x json": content type last, recipient before it
+            constrain = last
+            recipient = parts[-2].removeprefix(recipient_prefix)
 
     if constrain_words:
-        content_type = constrain_words[0]
+        constrain = constrain_words[0]
 
     return HarmonyHeader(
         role=role,
         channel=channel,
         recipient=recipient,
-        content_type=content_type,
+        constrain=constrain,
     )
 
 
@@ -342,27 +353,23 @@ class HarmonyStreamLexer:
         self,
         parser: HarmonyMessageParser,
         sink: "HarmonyStreamParser",
-        prefill_ids: Sequence[int],
+        role_ids: Sequence[int],
     ):
         self._parser = parser
         self._tokenizer = parser._tokenizer
         self._sink = sink
-        self._count: int = 0
+        self._position: int = 0
         self._message_start: int = 0
-        # Message-scoped state, reset at every message boundary.
-        self._section: str | None = None
-        self._sections: dict[str, list[int]] = {}
+        # Message-scoped state, reset at every message boundary. The
+        # stream resumes after the "<|start|>assistant" prefill, so it
+        # opens inside that message's role section, seeded with role_ids.
+        self._section: str | None = "role"
+        self._sections: dict[str, list[int]] = {"role": list(role_ids)}
         self._header: HarmonyHeader | None = None
         self._body_ids: list[int] = []
         self._prefix_offset: int = 0
         self._read_offset: int = 0
         self._prefix_text: str = ""
-        for token_id in prefill_ids:
-            self.push(token_id)
-        # The prefill belongs to the prompt, not the generation; the
-        # positions reported to the sink count generated tokens only.
-        self._count = 0
-        self._message_start = 0
 
     def push(self, token_id: int) -> None:
         begin = self._parser._begin_map.get(token_id)
@@ -370,7 +377,7 @@ class HarmonyStreamLexer:
             # <|start|> always delimits messages (as reverse_iter_messages
             # assumes); a missing end token must not merge two messages.
             self._finish_message()
-        self._count += 1
+        self._position += 1
         if begin is not None:
             if self._header is not None:
                 # A marker after <|message|> cannot reclassify a message
@@ -387,7 +394,7 @@ class HarmonyStreamLexer:
                         },
                     )
                 )
-                self._sink.begin_message(self._header, self._message_start)
+                self._sink.on_message_begin(self._header, self._message_start)
             else:
                 self._section = begin
                 self._sections[begin] = []
@@ -407,7 +414,7 @@ class HarmonyStreamLexer:
             self._prefix_text = self._tokenizer.decode(
                 self._body_ids[self._prefix_offset :]
             )
-            self._sink.body_text(delta)
+            self._sink.on_body_delta(delta)
 
     def _pending_text(self) -> str:
         new_text = self._tokenizer.decode(self._body_ids[self._prefix_offset :])
@@ -417,7 +424,7 @@ class HarmonyStreamLexer:
         if self._header is not None:
             # A message that ends mid-character emits the partial
             # character now; nothing will complete it anymore.
-            self._sink.end_message(self._pending_text())
+            self._sink.on_message_end(self._pending_text())
         self._section = None
         self._sections = {}
         self._header = None
@@ -425,7 +432,7 @@ class HarmonyStreamLexer:
         self._prefix_offset = 0
         self._read_offset = 0
         self._prefix_text = ""
-        self._message_start = self._count
+        self._message_start = self._position
 
 
 class HarmonyStreamParser:
@@ -444,7 +451,9 @@ class HarmonyStreamParser:
         self._reset()
 
     def _reset(self) -> None:
-        self._lexer = HarmonyStreamLexer(self._parser, self, self._prefill_ids)
+        # The prefill's <|start|> already opened a message; the lexer is
+        # seeded with the remaining ids as that message's role section.
+        self._lexer = HarmonyStreamLexer(self._parser, self, self._prefill_ids[1:])
         self._consumed: int = 0
         self._ids: list[int] = []
         self._content_start: int | None = None
@@ -484,8 +493,9 @@ class HarmonyStreamParser:
             # request reusing this instance, or interleaved n>1 choices);
             # rebuilding once is cheaper than misclassifying.
             self._reset()
-        for token_id in current_ids[self._consumed :]:
-            self._ids.append(token_id)
+        new_ids = current_ids[self._consumed :]
+        self._ids.extend(new_ids)
+        for token_id in new_ids:
             self._lexer.push(token_id)
         self._consumed = len(current_ids)
         reasoning = "".join(self._reasoning_parts)
@@ -494,11 +504,10 @@ class HarmonyStreamParser:
         self._content_parts.clear()
         return reasoning, content
 
-    def begin_message(self, header: HarmonyHeader, start: int) -> None:
+    def on_message_begin(self, header: HarmonyHeader, start: int) -> None:
         self._kind = header.kind
         if header.kind is HarmonyMessageKind.TOOL_CALL:
-            assert header.recipient is not None  # guaranteed by TOOL_CALL kind
-            self.calls.append((header.recipient[len(FUNCTION_NAMESPACE) :], ""))
+            self.calls.append((function_name(header), ""))
         elif header.kind is HarmonyMessageKind.REASONING:
             self._separator = "\n" if self._reasoning_seen else ""
         elif header.kind is HarmonyMessageKind.CONTENT:
@@ -513,7 +522,7 @@ class HarmonyStreamParser:
         ):
             self._content_start = start
 
-    def body_text(self, delta: str) -> None:
+    def on_body_delta(self, delta: str) -> None:
         if not delta:
             return
         if self._kind is HarmonyMessageKind.TOOL_CALL:
@@ -528,8 +537,8 @@ class HarmonyStreamParser:
             self._separator = ""
             self._content_seen = True
 
-    def end_message(self, tail: str) -> None:
-        self.body_text(tail)
+    def on_message_end(self, tail: str) -> None:
+        self.on_body_delta(tail)
         if self._kind is HarmonyMessageKind.TOOL_CALL and not self.calls[-1][1]:
             # The serving layer flushes unstreamed arguments only onto an
             # existing tool-call delta, so a parameterless call must

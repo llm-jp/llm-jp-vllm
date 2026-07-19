@@ -176,5 +176,5 @@ class Llmjp4ReasoningParser(ReasoningParser):
         padded = self._reasoning_prefill + list(input_ids)
         for message in self._parser.iter_messages(padded):
             if self._message_ends_reasoning(message):
-                return max(message.start - len(self._reasoning_prefill), 0)
+                return max(message.start_position - len(self._reasoning_prefill), 0)
         return None

@@ -22,11 +22,10 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser, ToolParserManager
 
 from llm_jp_vllm.llmjp4.harmony import (
-    FUNCTION_NAMESPACE,
-    HarmonyHeader,
     HarmonyMessageKind,
     HarmonyMessageParser,
     HarmonyStreamParser,
+    function_name,
     iter_text_messages,
 )
 
@@ -117,7 +116,7 @@ class Llmjp4ToolParser(ToolParser):
                             id=make_tool_call_id(),
                             type="function",
                             function=FunctionCall(
-                                name=self._function_name(message.header),
+                                name=function_name(message.header),
                                 arguments=self._normalize_arguments(message.body),
                             ),
                         )
@@ -227,7 +226,3 @@ class Llmjp4ToolParser(ToolParser):
             logger.warning("Tool call arguments are not valid JSON: %r", text)
             return text
         return json.dumps(parsed, ensure_ascii=False)
-
-    def _function_name(self, header: HarmonyHeader) -> str:
-        assert header.recipient is not None  # guaranteed by TOOL_CALL kind
-        return header.recipient[len(FUNCTION_NAMESPACE) :]

@@ -8,11 +8,11 @@ import pytest
 # collide with the dynamically assigned ids (>= 1000).
 _SPECIAL_TOKEN_IDS: dict[str, int] = {
     "<|return|>": 2,
-    "<|end|>": 7,
-    "<|message|>": 8,
+    "<|constrain|>": 8,
     "<|channel|>": 9,
     "<|start|>": 10,
-    "<|constrain|>": 12,
+    "<|end|>": 11,
+    "<|message|>": 12,
     "<|call|>": 13,
 }
 

@@ -156,6 +156,38 @@ def test_is_reasoning_end_streaming_tracks_cumulative_ids(
     assert results == sorted(results)  # flips exactly once
 
 
+def test_is_reasoning_end_streaming_ignores_completed_history_messages(
+    reasoning_parser, fake_tokenizer: FakeLlmjp4Tokenizer
+) -> None:
+    prompt_ids = fake_tokenizer.encode(
+        "<|start|>user<|message|>Hi<|end|>"
+        + "<|start|>assistant<|channel|>analysis<|message|>Old reasoning<|end|>"
+        + "<|start|>assistant<|channel|>final<|message|>Old answer<|end|>"
+        + "<|start|>user<|message|>And now?<|end|>"
+        + "<|start|>assistant"
+    )
+    generated_ids = fake_tokenizer.encode(
+        "<|channel|>analysis<|message|>New reasoning<|end|>"
+        + "<|start|>assistant<|channel|>final<|message|>"
+    )
+
+    # Structured-output engines pass all_token_ids (prompt included)
+    # and the step's delta as a plain iterator.
+    results = [
+        reasoning_parser.is_reasoning_end_streaming(
+            prompt_ids + generated_ids[:step],
+            iter(generated_ids[step - 1 : step]),
+        )
+        for step in range(1, len(generated_ids) + 1)
+    ]
+
+    # The completed answer of the previous turn must not end the new
+    # turn's reasoning early.
+    assert results[0] is False
+    assert results[-1] is True
+    assert results == sorted(results)
+
+
 def test_streaming_splits_messages_and_records_the_content_handover(
     reasoning_parser, fake_tokenizer: FakeLlmjp4Tokenizer
 ) -> None:

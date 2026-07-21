@@ -23,6 +23,15 @@ from llm_jp_vllm.llmjp4.harmony import (
     iter_text_messages,
 )
 
+# Tail window of the streaming boundary check. It must cover the whole
+# header of a boundary message: unlike the gpt-oss reference (which
+# matches "<|channel|>final" only and bounds its scan at pattern + 20),
+# our boundary includes tool-call headers whose recipient is a function
+# name of the caller's choosing — "assistant to=functions.<name>
+# <|channel|>commentary json" measures 15-25 tokens with the LLM-jp-4
+# tokenizer, so 64 leaves room for long names.
+_BOUNDARY_WINDOW = 64
+
 
 @ReasoningParserManager.register_module(["llmjp4"])  # type: ignore[arg-type]
 class Llmjp4ReasoningParser(ReasoningParser):
@@ -39,9 +48,11 @@ class Llmjp4ReasoningParser(ReasoningParser):
         # https://zenn.dev/yay1/articles/ad6958086670b0
         self._reasoning_prefill: list[int] = [10, 12811]
 
-        # The serving layer calls is_reasoning_end / extract_content_ids
-        # with per-step delta ids only; the reasoning boundary is tracked
-        # on this cumulative stream advanced in extract_reasoning_streaming.
+        # The serving layer never passes the full generated stream to
+        # is_reasoning_end / extract_content_ids (only per-step delta or
+        # prompt ids, depending on the vLLM version); the reasoning
+        # boundary is tracked on this cumulative stream advanced in
+        # extract_reasoning_streaming.
         self._stream = HarmonyStreamParser(self._parser, self._reasoning_prefill)
 
     def adjust_request(
@@ -68,16 +79,18 @@ class Llmjp4ReasoningParser(ReasoningParser):
     def is_reasoning_end_streaming(
         self, input_ids: Sequence[int], delta_ids: Iterable[int]
     ) -> bool:
-        # Structured-output engines call only this method, with cumulative
-        # ids, so the stream may still need advancing here; on the chat
-        # path extract_reasoning_streaming has already consumed the ids.
-        if self._stream.consumed != len(input_ids):
-            self._stream.advance(len(input_ids) - len(list(delta_ids)), input_ids)
-        return self._stream.content_started
+        # Structured-output engines call this with all_token_ids (prompt
+        # included) and latch the first True themselves, so only a
+        # boundary completed around this step's delta must be visible.
+        # A bounded tail keeps the check O(delta) and stateless: prompt
+        # history must not touch the chat-path stream.
+        delta_len = sum(1 for _ in delta_ids)
+        return self.is_reasoning_end(input_ids[-(delta_len + _BOUNDARY_WINDOW) :])
 
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
-        # Returns everything from the <|start|> of the first non-analysis
-        # message: the tool parser needs a well-formed message sequence.
+        # Returns everything from the opening marker of the first
+        # non-analysis message: the tool parser needs a well-formed
+        # message sequence.
         start = self._content_start(input_ids)
         if start is not None:
             return input_ids[start:]

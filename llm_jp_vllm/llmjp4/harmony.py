@@ -1,10 +1,10 @@
 # Generic parser for OpenAI Harmony format.
-# This is basically identical with the bundled parser in LLM-jp-4 models,
-# but typing annotation is modified to follow vLLM standards.
+# Based on the parser bundled with LLM-jp-4 models, restructured after
+# openai/harmony's StreamableParser state machine.
 
 import re
 from dataclasses import dataclass, field
-from enum import Enum, auto
+from enum import Enum
 from typing import Iterator, Sequence
 
 from vllm.tokenizers import TokenizerLike
@@ -26,44 +26,30 @@ class HarmonyMessageKind(Enum):
     (`_SegmentType.from_channel_and_recipient` in vllm/parser/harmony.py).
     """
 
-    REASONING = auto()
-    CONTENT = auto()
-    TOOL_CALL = auto()
-    IGNORE = auto()
-
-
-@dataclass(frozen=True)
-class HarmonySequence:
-    """A data class representing a sequence of tokens in the Harmony format."""
-
-    token_ids: list[int]
-    start: int  # Start position of the sequence in the original token sequence
+    REASONING = 1
+    CONTENT = 2
+    TOOL_CALL = 3
+    IGNORE = 4
 
 
 @dataclass(frozen=True)
 class HarmonyMessage:
-    """A data class representing a message in the Harmony format."""
+    """A data class representing a message in the Harmony format.
+
+    Each section holds the raw token ids of its span, e.g.
+    "<|start|>assistant<|channel|>final<|message|>Hi<|end|>" fills
+    role, channel and content with the ids of "assistant", "final"
+    and "Hi".
+    """
 
     end: HarmonyMessageEndType
-    role: HarmonySequence | None = None
-    channel: HarmonySequence | None = None
-    constrain: HarmonySequence | None = None
-    content: HarmonySequence | None = None
-    # Position of the message's <|start|> in the parsed sequence: section
-    # starts point just after their marker token; 0 when the message
-    # opens the sequence without a <|start|>.
-    start_position: int = field(init=False)
-
-    def __post_init__(self) -> None:
-        first_section = min(
-            (
-                section.start
-                for section in (self.role, self.channel, self.constrain, self.content)
-                if section is not None
-            ),
-            default=1,
-        )
-        object.__setattr__(self, "start_position", max(first_section - 1, 0))
+    # Position of the marker that opened this message (normally its
+    # <|start|>) in the parsed sequence.
+    start_position: int
+    role: list[int] | None = None
+    channel: list[int] | None = None
+    constrain: list[int] | None = None
+    content: list[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -73,8 +59,7 @@ class HarmonyHeader:
     role: str | None = None
     channel: str | None = None
     recipient: str | None = None
-    # Called "content type" by openai/harmony; named after the marker here.
-    constrain: str | None = None
+    content_type: str | None = None
     # Classification of the message this header belongs to.
     kind: HarmonyMessageKind = field(init=False)
 
@@ -106,41 +91,52 @@ def _header_from_words(
 ) -> HarmonyHeader:
     """Build a header from the whitespace-split words of each section.
 
-    Header sections carry space-separated words (the tokenizer preserves
-    the spaces of the header text), so splitting on whitespace recovers
-    them. Follows openai/harmony's ``parse_header_from_string``:
-    recipient ("to=...") and content type are read from the tail of the
-    header words, so a recipient is recognized on both sides of
-    <|channel|> (the LLM-jp-4 template and official examples place it
-    differently).
+    Two header shapes occur in practice, differing in which section the
+    recipient ("to=...") rides in::
+
+        assistant to=functions.x<|channel|>commentary json   (template)
+        assistant<|channel|>commentary to=functions.x json   (official)
+
+    so the inputs are the section's own value plus any words riding in
+    it — e.g. role_words=["assistant", "to=functions.x"],
+    channel_words=["commentary", "json"] for the first shape. Both
+    shapes parse to role="assistant", channel="commentary",
+    recipient="functions.x", content_type="json".
+
+    Follows openai/harmony's ``parse_header_from_string``: the role and
+    channel values are stripped and recipient / content type are read
+    from the tail of the remaining words, which recognizes both shapes
+    with one rule.
     """
     recipient_prefix = "to="
     role = role_words[0] if role_words else None
     channel = channel_words[0] if channel_words else None
-    parts = role_words[1:] + channel_words[1:]
+    remaining_words = role_words[1:] + channel_words[1:]
 
     recipient: str | None = None
-    constrain: str | None = None
-    if parts:
-        last = parts[-1]
+    content_type: str | None = None
+    if remaining_words:
+        last = remaining_words[-1]
         if last.startswith(recipient_prefix):
+            # e.g. "to=functions.x": a recipient and no content type.
             recipient = last[len(recipient_prefix) :]
-        elif len(parts) == 1:
+        elif len(remaining_words) == 1:
             # A single word that is not "to=..." is a bare recipient.
             recipient = last
         else:
-            # e.g. "to=functions.x json": content type last, recipient before it
-            constrain = last
-            recipient = parts[-2].removeprefix(recipient_prefix)
+            # e.g. "to=functions.x json": content type last, recipient
+            # before it.
+            content_type = last
+            recipient = remaining_words[-2].removeprefix(recipient_prefix)
 
     if constrain_words:
-        constrain = constrain_words[0]
+        content_type = constrain_words[0]
 
     return HarmonyHeader(
         role=role,
         channel=channel,
         recipient=recipient,
-        constrain=constrain,
+        content_type=content_type,
     )
 
 
@@ -161,9 +157,8 @@ _END_MARKERS = frozenset({"<|end|>", "<|return|>", "<|call|>"})
 def iter_text_messages(text: str) -> Iterator[HarmonyTextMessage]:
     """Lex decoded model output into Harmony messages.
 
-    Applies the same rules as ``HarmonyStreamLexer``: <|start|> always
-    delimits messages, a marker after <|message|> cannot reclassify a
-    message, and a message whose header never reaches <|message|> is
+    Applies the same rules as ``HarmonyMessageParser.iter_messages``,
+    except that a message whose header never reaches <|message|> is
     dropped. The text is assumed to continue the "<|start|>assistant"
     prefill, so the first message's role is pre-seeded.
     """
@@ -174,57 +169,109 @@ def iter_text_messages(text: str) -> Iterator[HarmonyTextMessage]:
     message_start = 0
     position = 0
 
+    def parse_sections() -> HarmonyHeader:
+        return _header_from_words(
+            role_words=sections.get("role", "").split(),
+            channel_words=sections.get("channel", "").split(),
+            constrain_words=sections.get("constrain", "").split(),
+        )
+
     for match in _MARKER_RE.finditer(text):
         segment = text[position : match.start()]
+        marker = match.group()
         position = match.end()
+
         if header is not None:
             body_parts.append(segment)
+            if marker in _END_MARKERS:
+                yield HarmonyTextMessage(header, "".join(body_parts), message_start)
+                sections = {}
+                section = None
+                header = None
+                body_parts = []
+            else:
+                # Any marker after <|message|> is body text.
+                body_parts.append(marker)
         elif section is not None:
             sections[section] = sections.get(section, "") + segment
-
-        marker = match.group()
-        if marker == "<|start|>" or marker in _END_MARKERS:
-            if header is not None:
-                yield HarmonyTextMessage(header, "".join(body_parts), message_start)
-            sections = {}
-            header = None
-            body_parts = []
-            if marker == "<|start|>":
-                # <|start|> always delimits messages; a missing end token
-                # must not merge two messages.
-                section = "role"
-                message_start = match.start()
-            else:
+            if marker in _END_MARKERS:
+                # A message whose header never reached <|message|> has
+                # no body to report.
+                sections = {}
                 section = None
-                message_start = position
-        elif header is not None:
-            # A marker after <|message|> cannot reclassify a message
-            # whose text was already collected.
-            pass
-        elif marker == "<|message|>":
-            header = _header_from_words(
-                sections.get("role", "").split(),
-                sections.get("channel", "").split(),
-                sections.get("constrain", "").split(),
-            )
-        else:
-            section = "channel" if marker == "<|channel|>" else "constrain"
-            sections[section] = ""
+            elif marker == "<|message|>":
+                header = parse_sections()
+            elif marker == "<|start|>":
+                # <|start|> inside a header is header text.
+                sections[section] += marker
+            else:
+                section = "channel" if marker == "<|channel|>" else "constrain"
+                sections[section] = ""
+        elif marker not in _END_MARKERS:
+            # This marker opens the message; a stray end marker or text
+            # between messages is dropped.
+            message_start = match.start()
+            if marker == "<|start|>":
+                section = "role"
+                sections = {"role": ""}
+            elif marker == "<|message|>":
+                header = parse_sections()
+            else:
+                section = "channel" if marker == "<|channel|>" else "constrain"
+                sections = {section: ""}
 
     if header is not None:
         body_parts.append(text[position:])
         yield HarmonyTextMessage(header, "".join(body_parts), message_start)
 
 
+@dataclass
+class _ExpectStart:
+    """Between messages, waiting for a marker that opens one."""
+
+
+@dataclass
+class _Header:
+    """A message under construction: its start position, raw sections
+    and the section now being collected ("content" after <|message|> in
+    the batch parser; the stream lexer switches to _Content instead).
+    """
+
+    start: int
+    sections: dict[str, list[int]]
+    section: str
+
+
+@dataclass
+class _Content:
+    """Streaming a body after <|message|>: the parsed header plus the
+    incremental-decode window of ``HarmonyStreamLexer``.
+    """
+
+    header: HarmonyHeader
+    body_ids: list[int] = field(default_factory=list)
+    prefix_offset: int = 0
+    read_offset: int = 0
+    prefix_text: str = ""
+
+
 class HarmonyMessageParser:
-    """A parser that performs lexical analysis to extract Harmony messages."""
+    """A parser that performs lexical analysis to extract Harmony messages.
+
+    A message is a marker-delimited span such as::
+
+        <|start|>assistant<|channel|>analysis<|message|>Reasoning<|end|>
+
+    where the header sections (role, channel, constrain) precede the
+    <|message|> body and <|end|> / <|return|> / <|call|> close the
+    message.
+    """
 
     def __init__(self, tokenizer: TokenizerLike):
         vocab = tokenizer.get_vocab()
         self._tokenizer = tokenizer
         self._start_id = vocab["<|start|>"]
         self._begin_map = {
-            vocab["<|start|>"]: "role",
             vocab["<|channel|>"]: "channel",
             vocab["<|constrain|>"]: "constrain",
             vocab["<|message|>"]: "content",
@@ -236,21 +283,31 @@ class HarmonyMessageParser:
         }
 
     def parse_header(self, message: HarmonyMessage) -> HarmonyHeader:
-        """Parse the header sections of a message into structured metadata."""
-        return _header_from_words(
-            self._section_words(message.role),
-            self._section_words(message.channel),
-            self._section_words(message.constrain),
-        )
+        """Parse the header sections of a message into structured metadata.
 
-    def _section_words(self, section: HarmonySequence | None) -> list[str]:
-        if section is None:
-            return []
-        return self._tokenizer.decode(section.token_ids).split()
+        The tokenizer preserves the spaces of the header text, so
+        decoding a section and splitting on whitespace recovers its
+        space-separated words.
+        """
+        role_words, channel_words, constrain_words = (
+            self._tokenizer.decode(section).split() if section else []
+            for section in (message.role, message.channel, message.constrain)
+        )
+        return _header_from_words(
+            role_words=role_words,
+            channel_words=channel_words,
+            constrain_words=constrain_words,
+        )
 
     def iter_messages(self, token_ids: Sequence[int]) -> Iterator[HarmonyMessage]:
         """
         Parse given token ids into messages.
+
+        Follows the state machine of openai/harmony's ``StreamableParser``
+        (ExpectStart / Header / Content): a marker after <|message|> is
+        body text, only an end marker closes a message, and tokens between
+        messages are dropped. A header marker may open a message without
+        <|start|>.
 
         Args:
             token_ids: A sequence of token ids to be parsed.
@@ -259,49 +316,50 @@ class HarmonyMessageParser:
             Detected HarmonyMessages.
         """
 
-        message_dict: dict[str, HarmonySequence] = {}
-        section: str | None = None  # None indicates out-of-message.
-        text_ids: list[int] = []
-        text_start: int | None = None
+        state: _ExpectStart | _Header = _ExpectStart()
 
         for token_position, token_id in enumerate(token_ids):
-            if token_id in self._begin_map:
-                if section is not None:
-                    assert text_start is not None
-                    message_dict[section] = HarmonySequence(
-                        token_ids=text_ids,
-                        start=text_start,
+            begin = self._begin_map.get(token_id)
+
+            if token_id in self._end_map:
+                # A stray end token between messages yields nothing.
+                if isinstance(state, _Header):
+                    yield HarmonyMessage(
+                        **state.sections,
+                        end=self._end_map[token_id],
+                        start_position=state.start,
                     )
-                section = self._begin_map[token_id]
-                text_ids = []
-                text_start = token_position + 1
+                    state = _ExpectStart()
 
-            elif token_id in self._end_map:
-                if section is not None:
-                    assert text_start is not None
-                    message_dict[section] = HarmonySequence(
-                        token_ids=text_ids,
-                        start=text_start,
-                    )
+            elif isinstance(state, _Header):
+                if state.section == "content":
+                    # Any marker after <|message|> is body text.
+                    state.sections["content"].append(token_id)
+                elif begin is None:
+                    # Text tokens and a nested <|start|> are header text.
+                    state.sections[state.section].append(token_id)
+                else:
+                    state.section = begin
+                    state.sections[begin] = []
 
-                yield HarmonyMessage(**message_dict, end=self._end_map[token_id])
+            elif token_id == self._start_id:
+                state = _Header(
+                    start=token_position, sections={"role": []}, section="role"
+                )
 
-                message_dict = {}
-                section = None
-                text_ids = []
-                text_start = None
+            elif begin is not None:
+                # A section marker may open a message without <|start|>
+                # so that a degraded sequence keeps its final answer.
+                state = _Header(
+                    start=token_position, sections={begin: []}, section=begin
+                )
 
-            else:
-                if section is not None:
-                    text_ids.append(token_id)
-
-        if section is not None:
-            assert text_start is not None
-            message_dict[section] = HarmonySequence(
-                token_ids=text_ids,
-                start=text_start,
+        if isinstance(state, _Header):
+            yield HarmonyMessage(
+                **state.sections,
+                end=HarmonyMessageEndType.INCOMPLETE,
+                start_position=state.start,
             )
-            yield HarmonyMessage(**message_dict, end=HarmonyMessageEndType.INCOMPLETE)
 
     def get_all_messages(self, token_ids: Sequence[int]) -> list[HarmonyMessage]:
         """
@@ -314,25 +372,6 @@ class HarmonyMessageParser:
             A list of detected HarmonyMessages.
         """
         return list(self.iter_messages(token_ids))
-
-    def reverse_iter_messages(
-        self, token_ids: Sequence[int]
-    ) -> Iterator[HarmonyMessage]:
-        """
-        Parse given token ids into messages in reverse order.
-
-        Args:
-            token_ids: A sequence of token ids to be parsed.
-
-        Yields:
-            Detected HarmonyMessages in reverse order.
-        """
-        end_position = len(token_ids)
-
-        for i in range(len(token_ids) - 1, -1, -1):
-            if token_ids[i] == self._start_id:
-                yield next(self.iter_messages(token_ids[i:end_position]))
-                end_position = i
 
 
 class HarmonyStreamLexer:
@@ -359,80 +398,79 @@ class HarmonyStreamLexer:
         self._tokenizer = parser._tokenizer
         self._sink = sink
         self._position: int = 0
-        self._message_start: int = 0
-        # Message-scoped state, reset at every message boundary. The
-        # stream resumes after the "<|start|>assistant" prefill, so it
-        # opens inside that message's role section, seeded with role_ids.
-        self._section: str | None = "role"
-        self._sections: dict[str, list[int]] = {"role": list(role_ids)}
-        self._header: HarmonyHeader | None = None
-        self._body_ids: list[int] = []
-        self._prefix_offset: int = 0
-        self._read_offset: int = 0
-        self._prefix_text: str = ""
+        # The stream resumes after the "<|start|>assistant" prefill, so
+        # it opens inside that message's role section, seeded with
+        # role_ids.
+        self._state: _ExpectStart | _Header | _Content = _Header(
+            start=0, sections={"role": list(role_ids)}, section="role"
+        )
 
     def push(self, token_id: int) -> None:
+        state = self._state
         begin = self._parser._begin_map.get(token_id)
-        if begin == "role":
-            # <|start|> always delimits messages (as reverse_iter_messages
-            # assumes); a missing end token must not merge two messages.
-            self._finish_message()
         self._position += 1
-        if begin is not None:
-            if self._header is not None:
-                # A marker after <|message|> cannot reclassify a message
-                # whose text was already emitted.
-                return
-            if begin == "content":
-                self._header = self._parser.parse_header(
-                    HarmonyMessage(
-                        end=HarmonyMessageEndType.INCOMPLETE,
-                        **{
-                            # Start positions are unused on this path.
-                            name: HarmonySequence(token_ids=ids, start=0)
-                            for name, ids in self._sections.items()
-                        },
-                    )
-                )
-                self._sink.on_message_begin(self._header, self._message_start)
-            else:
-                self._section = begin
-                self._sections[begin] = []
-        elif token_id in self._parser._end_map:
-            self._finish_message()
-        elif self._header is not None:
-            self._push_body(token_id)
-        elif self._section is not None:
-            self._sections[self._section].append(token_id)
 
-    def _push_body(self, token_id: int) -> None:
-        self._body_ids.append(token_id)
-        delta = self._pending_text()
+        if token_id in self._parser._end_map:
+            # Between messages this is a stray end token and a no-op.
+            self._finish_message()
+        elif isinstance(state, _Content):
+            # Any marker after <|message|> is body text.
+            self._push_body(state, token_id)
+        elif isinstance(state, _Header):
+            if begin is None:
+                # Text tokens and a nested <|start|> are header text.
+                state.sections[state.section].append(token_id)
+            elif begin == "content":
+                self._begin_content(state)
+            else:
+                state.section = begin
+                state.sections[begin] = []
+        elif token_id == self._parser._start_id:
+            self._state = _Header(
+                start=self._position - 1, sections={"role": []}, section="role"
+            )
+        elif begin is not None:
+            # A section marker may open a message without <|start|> so
+            # that a degraded sequence keeps its final answer.
+            opened = _Header(start=self._position - 1, sections={}, section=begin)
+            if begin == "content":
+                self._begin_content(opened)
+            else:
+                opened.sections[begin] = []
+                self._state = opened
+
+    def _begin_content(self, state: _Header) -> None:
+        header = self._parser.parse_header(
+            HarmonyMessage(
+                end=HarmonyMessageEndType.INCOMPLETE,
+                start_position=state.start,
+                **state.sections,
+            )
+        )
+        self._state = _Content(header=header)
+        self._sink.on_message_begin(header, state.start)
+
+    def _push_body(self, state: _Content, token_id: int) -> None:
+        state.body_ids.append(token_id)
+        delta = self._pending_text(state)
         if delta and not delta.endswith("�"):
-            self._prefix_offset = self._read_offset
-            self._read_offset = len(self._body_ids)
-            self._prefix_text = self._tokenizer.decode(
-                self._body_ids[self._prefix_offset :]
+            state.prefix_offset = state.read_offset
+            state.read_offset = len(state.body_ids)
+            state.prefix_text = self._tokenizer.decode(
+                state.body_ids[state.prefix_offset :]
             )
             self._sink.on_body_delta(delta)
 
-    def _pending_text(self) -> str:
-        new_text = self._tokenizer.decode(self._body_ids[self._prefix_offset :])
-        return new_text[len(self._prefix_text) :]
+    def _pending_text(self, state: _Content) -> str:
+        new_text = self._tokenizer.decode(state.body_ids[state.prefix_offset :])
+        return new_text[len(state.prefix_text) :]
 
     def _finish_message(self) -> None:
-        if self._header is not None:
+        if isinstance(self._state, _Content):
             # A message that ends mid-character emits the partial
             # character now; nothing will complete it anymore.
-            self._sink.on_message_end(self._pending_text())
-        self._section = None
-        self._sections = {}
-        self._header = None
-        self._body_ids = []
-        self._prefix_offset = 0
-        self._read_offset = 0
-        self._prefix_text = ""
-        self._message_start = self._position
+            self._sink.on_message_end(self._pending_text(self._state))
+        self._state = _ExpectStart()
 
 
 class HarmonyStreamParser:

@@ -171,9 +171,9 @@ def test_streaming_delta_protocol(
             "<|start|>assistant to=functions.echo"
             + '<|channel|>commentary json<|message|>{"text"'
             + '<|message|>: "Hi"}<|call|>',
-            [("echo", '{"text": "Hi"}')],
+            [("echo", '{"text"<|message|>: "Hi"}')],
             "",
-            id="duplicate-message-marker-does-not-open-a-second-call",
+            id="duplicate-message-marker-is-body-text",
         ),
         # The serving layer cannot flush "{}" for a call whose final
         # step produced no delta; the parser must stream it.

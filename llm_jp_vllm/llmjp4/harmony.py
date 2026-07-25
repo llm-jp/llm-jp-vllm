@@ -59,7 +59,7 @@ class HarmonyHeader:
     role: str | None = None
     channel: str | None = None
     recipient: str | None = None
-    content_type: str | None = None
+    constrain: str | None = None
     # Classification of the message this header belongs to.
     kind: HarmonyMessageKind = field(init=False)
 
@@ -101,10 +101,10 @@ def _header_from_words(
     it — e.g. role_words=["assistant", "to=functions.x"],
     channel_words=["commentary", "json"] for the first shape. Both
     shapes parse to role="assistant", channel="commentary",
-    recipient="functions.x", content_type="json".
+    recipient="functions.x", constrain="json".
 
     Follows openai/harmony's ``parse_header_from_string``: the role and
-    channel values are stripped and recipient / content type are read
+    channel values are stripped and recipient / constrain value are read
     from the tail of the remaining words, which recognizes both shapes
     with one rule.
     """
@@ -114,29 +114,29 @@ def _header_from_words(
     remaining_words = role_words[1:] + channel_words[1:]
 
     recipient: str | None = None
-    content_type: str | None = None
+    constrain: str | None = None
     if remaining_words:
         last = remaining_words[-1]
         if last.startswith(recipient_prefix):
-            # e.g. "to=functions.x": a recipient and no content type.
+            # e.g. "to=functions.x": a recipient and no constrain value.
             recipient = last[len(recipient_prefix) :]
         elif len(remaining_words) == 1:
             # A single word that is not "to=..." is a bare recipient.
             recipient = last
         else:
-            # e.g. "to=functions.x json": content type last, recipient
+            # e.g. "to=functions.x json": constrain value last, recipient
             # before it.
-            content_type = last
+            constrain = last
             recipient = remaining_words[-2].removeprefix(recipient_prefix)
 
     if constrain_words:
-        content_type = constrain_words[0]
+        constrain = constrain_words[0]
 
     return HarmonyHeader(
         role=role,
         channel=channel,
         recipient=recipient,
-        content_type=content_type,
+        constrain=constrain,
     )
 
 

@@ -91,22 +91,20 @@ def _header_from_words(
 ) -> HarmonyHeader:
     """Build a header from the whitespace-split words of each section.
 
-    Two header shapes occur in practice, differing in which section the
-    recipient ("to=...") rides in::
+    The recipient ("to=...") appears in either the role or the channel
+    section::
 
-        assistant to=functions.x<|channel|>commentary json   (template)
-        assistant<|channel|>commentary to=functions.x json   (official)
+        assistant to=functions.x<|channel|>commentary json   (chat template)
+        assistant<|channel|>commentary to=functions.x json   (docs example)
 
-    so the inputs are the section's own value plus any words riding in
-    it — e.g. role_words=["assistant", "to=functions.x"],
-    channel_words=["commentary", "json"] for the first shape. Both
-    shapes parse to role="assistant", channel="commentary",
-    recipient="functions.x", constrain="json".
+    The role-side placement is not explicit in the harmony spec, but
+    openai/harmony's parser tests cover it and the LLM-jp-4 chat template
+    renders tool calls this way; see
+    https://github.com/llm-jp/llm-jp-vllm/pull/6#discussion_r3655430969.
 
-    Follows openai/harmony's ``parse_header_from_string``: the role and
-    channel values are stripped and recipient / constrain value are read
-    from the tail of the remaining words, which recognizes both shapes
-    with one rule.
+    Following upstream ``parse_header_from_string``, the role and channel
+    values are stripped and recipient / constrain value are read from the
+    tail of the remaining words, so one rule recognizes both shapes.
     """
     recipient_prefix = "to="
     role = role_words[0] if role_words else None

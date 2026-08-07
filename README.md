@@ -25,3 +25,27 @@ vllm serve {llm-jp-4 model} \
   --reasoning-parser llmjp4 \
   --reasoning-parser-plugin llm_jp_vllm.llmjp4
 ```
+
+### Tool calling
+
+The `llmjp4` tool parser converts Harmony-format tool calls (including
+the parallel call extension of LLM-jp-4) into OpenAI-compatible
+`tool_calls`, for both streaming and non-streaming responses:
+
+```shell
+vllm serve {llm-jp-4 model} \
+  --trust-remote-code \
+  --reasoning-parser llmjp4 \
+  --reasoning-parser-plugin llm_jp_vllm.llmjp4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser llmjp4 \
+  --tool-parser-plugin llm_jp_vllm.llmjp4
+```
+
+## Development
+
+```shell
+uv sync --all-extras --dev
+./checks.sh  # ruff / mypy
+uv run pytest
+```

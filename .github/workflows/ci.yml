@@ -31,7 +31,7 @@ jobs:
       run: uv sync --all-extras --dev
 
     - name: Perform lint
-      run: uv run ruff check llm_jp_vllm
-    
+      run: uv run ruff check llm_jp_vllm tests
+
     - name: Perform format
-      run: uv run ruff format --check llm_jp_vllm
+      run: uv run ruff format --check llm_jp_vllm tests

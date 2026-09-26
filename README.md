@@ -15,10 +15,6 @@ The above command installs `llm-jp-vllm` directory onto your environment's `site
 
 This repository works with the plugin mechanism on vLLM.
 
-After [necessary change in vLLM](https://github.com/vllm-project/vllm/pull/45241) was merged,
-you can use reasoning/tool parsers implemented in this repository
-by passing appropriate module names to `--reasoning/tool-parser-plugin` option.
-
 ```shell
 vllm serve {llm-jp-4 model} \
   --trust-remote-code \
